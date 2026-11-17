@@ -30,6 +30,7 @@
 #include "vaapi_decoder.h"
 #include "vaapi_encoder.h"
 #include "vaapi_info.h"
+#include "vaapi_vpp.h"
 
 #ifndef VAAPI_DEMO_VERSION
 #define VAAPI_DEMO_VERSION "1.0.0"
@@ -135,6 +136,8 @@ typedef struct {
     int gop;
     int max_frames;
     int bframes;
+    int scale_width;
+    int scale_height;
     int quiet;
     enum AVPixelFormat pix_fmt;
 } EncodeParams;
@@ -143,19 +146,29 @@ static int run_encode(const EncodeParams *params, RunStats *stats)
 {
     VaapiEncoderConfig config;
     VaapiEncoder *encoder = NULL;
+    VaapiVpp *vpp = NULL;
+    AVBufferRef *device_ctx = NULL;
     FILE *input_file = NULL;
     FILE *output_file = NULL;
     AVFrame *frame = NULL;
     PacketSink sink = { 0 };
     Progress progress;
+    char codec_name[32];
+    int scaling    = params->scale_width > 0 && params->scale_height > 0;
+    int out_width  = scaling ? params->scale_width  : params->width;
+    int out_height = scaling ? params->scale_height : params->height;
     int ret = -1;
     int frames = 0;
     int64_t start_us;
 
+    snprintf(codec_name, sizeof(codec_name), "%s_vaapi",
+             (params->codec && (!strcasecmp(params->codec, "hevc") ||
+                                !strcasecmp(params->codec, "h265"))) ? "hevc" : "h264");
+
     memset(&config, 0, sizeof(config));
     config.codec           = params->codec;
-    config.width           = params->width;
-    config.height          = params->height;
+    config.width           = out_width;
+    config.height          = out_height;
     config.fps             = params->fps;
     config.bitrate_kbps    = params->bitrate_kbps;
     config.qp              = params->qp;
@@ -179,7 +192,23 @@ static int run_encode(const EncodeParams *params, RunStats *stats)
         return -1;
     }
 
-    if (vaapi_encoder_open(&encoder, &config) < 0) {
+    if (scaling) {
+        /*
+         * 编码前 VPP 缩放：
+         *   YUV -> (上传) -> VPP scale_vaapi -> 编码器，全程在显存内完成。
+         * 编码器的帧池要等第一帧缩放结果出来后才能确定，因此延迟到循环里打开。
+         */
+        device_ctx = vaapi_device_create(params->device, params->connection_type);
+        if (!device_ctx)
+            goto cleanup;
+
+        vpp = vaapi_vpp_create(device_ctx, NULL, params->width, params->height,
+                               out_width, out_height, params->fps);
+        if (!vpp) {
+            LOG_ERROR("初始化编码前 VPP 缩放失败");
+            goto cleanup;
+        }
+    } else if (vaapi_encoder_open(&encoder, &config) < 0) {
         LOG_ERROR("初始化硬件编码器失败");
         goto cleanup;
     }
@@ -187,11 +216,14 @@ static int run_encode(const EncodeParams *params, RunStats *stats)
     if (!params->quiet) {
         LOG_INFO("输入文件 : %s", params->input);
         LOG_INFO("输出文件 : %s", params->output);
-        LOG_INFO("编码器   : %s | %dx%d @ %d fps | %s", vaapi_encoder_codec_name(encoder),
-                 params->width, params->height, params->fps,
+        LOG_INFO("编码器   : %s | %dx%d @ %d fps | %s", codec_name,
+                 out_width, out_height, params->fps,
                  params->bitrate_kbps > 0
                      ? util_format_bitrate(params->bitrate_kbps * 1000.0)
                      : "恒定质量模式");
+        if (scaling)
+            LOG_INFO("VPP 缩放 : %dx%d -> %dx%d (GPU VideoProc)",
+                     params->width, params->height, out_width, out_height);
     }
 
     frame = av_frame_alloc();
@@ -214,10 +246,41 @@ static int run_encode(const EncodeParams *params, RunStats *stats)
 
         if (!util_read_yuv_frame(input_file, frame))
             break;
-
         frame->pts = frames;
-        if (vaapi_encoder_send_sw(encoder, frame, sink_write_packet, &sink) < 0)
+
+        if (scaling) {
+            AVFrame *hw_in  = NULL;
+            AVFrame *hw_out = NULL;
+            int send_ret;
+
+            hw_in = vaapi_frame_upload(vaapi_vpp_input_frames(vpp), frame);
+            if (!hw_in) {
+                LOG_ERROR("上传输入图像失败");
+                goto cleanup;
+            }
+            send_ret = vaapi_vpp_process(vpp, hw_in, &hw_out);
+            av_frame_free(&hw_in);
+            if (send_ret < 0)
+                goto cleanup;
+
+            if (!encoder) {
+                config.hw_device_ctx = device_ctx;
+                config.hw_frames_ctx = hw_out->hw_frames_ctx;
+                if (vaapi_encoder_open(&encoder, &config) < 0) {
+                    LOG_ERROR("初始化硬件编码器失败");
+                    av_frame_free(&hw_out);
+                    goto cleanup;
+                }
+            }
+
+            send_ret = vaapi_encoder_send(encoder, hw_out, sink_write_packet, &sink);
+            av_frame_free(&hw_out);
+            if (send_ret < 0)
+                goto cleanup;
+        } else if (vaapi_encoder_send_sw(encoder, frame, sink_write_packet, &sink) < 0) {
             goto cleanup;
+        }
+
         frames++;
         progress_tick(&progress, sink.bytes - bytes_before);
     }
@@ -256,6 +319,9 @@ cleanup:
         av_frame_free(&frame);
     if (encoder)
         vaapi_encoder_close(encoder);
+    if (vpp)
+        vaapi_vpp_free(vpp);
+    av_buffer_unref(&device_ctx);
     if (output_file)
         fclose(output_file);
     if (input_file)
@@ -277,6 +343,7 @@ static void encode_usage(void)
         "  -i, --input <文件>        输入原始 YUV（默认 samples/%s）\n"
         "  -o, --output <文件>       输出码流（默认 output/encoded.h264|h265）\n"
         "  -s, --size <宽x高>        输入分辨率，默认 1920x1080\n"
+        "  -S, --scale <宽x高>       编码前用 VPP 缩放，例如 1280x720（默认不缩放）\n"
         "  -p, --pix-fmt <i420|nv12> 输入像素格式，默认 i420\n"
         "  -c, --codec <h264|hevc>   编码格式，默认 h264\n"
         "  -r, --fps <帧率>          帧率，默认 25\n"
@@ -302,6 +369,7 @@ static int command_encode(int argc, char **argv)
         { "input",           required_argument, NULL, 'i' },
         { "output",          required_argument, NULL, 'o' },
         { "size",            required_argument, NULL, 's' },
+        { "scale",           required_argument, NULL, 'S' },
         { "pix-fmt",         required_argument, NULL, 'p' },
         { "codec",           required_argument, NULL, 'c' },
         { "fps",             required_argument, NULL, 'r' },
@@ -328,13 +396,20 @@ static int command_encode(int argc, char **argv)
     params.connection_type = "drm";
     params.pix_fmt         = AV_PIX_FMT_YUV420P;
 
-    while ((c = getopt_long(argc, argv, "i:o:s:p:c:r:b:g:d:qh", options, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "i:o:s:S:p:c:r:b:g:d:qh", options, NULL)) != -1) {
         switch (c) {
         case 'i': params.input = optarg; break;
         case 'o': params.output = optarg; break;
         case 's':
             if (vaapi_parse_size(optarg, &params.width, &params.height) < 0) {
                 LOG_ERROR("分辨率格式错误: %s (应形如 1920x1080)", optarg);
+                return 1;
+            }
+            break;
+        case 'S':
+            if (vaapi_parse_size(optarg, &params.scale_width, &params.scale_height) < 0 ||
+                (params.scale_width & 1) || (params.scale_height & 1)) {
+                LOG_ERROR("缩放尺寸格式错误: %s (应形如 1280x720，且宽高为偶数)", optarg);
                 return 1;
             }
             break;
@@ -399,6 +474,8 @@ typedef struct {
     const char *snapshot;
     enum AVPixelFormat out_format;
     int max_frames;
+    int scale_width;
+    int scale_height;
     int quiet;
 } DecodeParams;
 
@@ -447,6 +524,8 @@ static int run_decode(const DecodeParams *params, RunStats *stats)
     config.want_hw_frames  = 0;
     config.out_format      = params->out_format;
     config.max_frames      = params->max_frames;
+    config.scale_width     = params->scale_width;
+    config.scale_height    = params->scale_height;
 
     if (vaapi_decoder_open(&decoder, params->input, &config) < 0)
         return -1;
@@ -464,9 +543,13 @@ static int run_decode(const DecodeParams *params, RunStats *stats)
     if (!params->quiet) {
         LOG_INFO("输入文件 : %s", params->input);
         LOG_INFO("解码器   : %s (VAAPI) | %dx%d | %.3f fps | 时长 %.2f 秒",
-                 vaapi_decoder_codec_name(decoder), vaapi_decoder_width(decoder),
-                 vaapi_decoder_height(decoder), vaapi_decoder_fps(decoder),
+                 vaapi_decoder_codec_name(decoder), vaapi_decoder_source_width(decoder),
+                 vaapi_decoder_source_height(decoder), vaapi_decoder_fps(decoder),
                  vaapi_decoder_duration(decoder));
+        if (params->scale_width > 0)
+            LOG_INFO("VPP 缩放 : %dx%d -> %dx%d (GPU VideoProc)",
+                     vaapi_decoder_source_width(decoder), vaapi_decoder_source_height(decoder),
+                     vaapi_decoder_width(decoder), vaapi_decoder_height(decoder));
         if (params->output)
             LOG_INFO("输出文件 : %s (%s)", params->output,
                      av_get_pix_fmt_name(params->out_format));
@@ -518,6 +601,7 @@ static void decode_usage(void)
         "  -i, --input <文件>        输入视频（默认 samples/%s）\n"
         "  -o, --output <文件>       输出原始 YUV（默认 output/decoded_<fmt>.yuv）\n"
         "  -p, --pix-fmt <i420|nv12> 输出像素格式，默认 i420\n"
+        "  -S, --scale <宽x高>       解码后用 VPP 缩放，例如 1280x720（默认不缩放）\n"
         "      --max-frames <N>      只解码前 N 帧\n"
         "      --snapshot <文件.ppm> 保存首帧为图片，便于无显示环境查看画面\n"
         "  -d, --device <节点>       DRM 设备，例如 /dev/dri/renderD128\n"
@@ -537,6 +621,7 @@ static int command_decode(int argc, char **argv)
         { "input",           required_argument, NULL, 'i' },
         { "output",          required_argument, NULL, 'o' },
         { "pix-fmt",         required_argument, NULL, 'p' },
+        { "scale",           required_argument, NULL, 'S' },
         { "max-frames",      required_argument, NULL, 1000 },
         { "snapshot",        required_argument, NULL, 1001 },
         { "device",          required_argument, NULL, 'd' },
@@ -551,13 +636,20 @@ static int command_decode(int argc, char **argv)
     params.connection_type = "drm";
     params.out_format      = AV_PIX_FMT_YUV420P;
 
-    while ((c = getopt_long(argc, argv, "i:o:p:d:qh", options, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "i:o:p:S:d:qh", options, NULL)) != -1) {
         switch (c) {
         case 'i': params.input = optarg; break;
         case 'o': params.output = optarg; break;
         case 'p':
             if (parse_pix_fmt(optarg, &params.out_format) < 0) {
                 LOG_ERROR("不支持的像素格式: %s (可选 i420 / nv12)", optarg);
+                return 1;
+            }
+            break;
+        case 'S':
+            if (vaapi_parse_size(optarg, &params.scale_width, &params.scale_height) < 0 ||
+                (params.scale_width & 1) || (params.scale_height & 1)) {
+                LOG_ERROR("缩放尺寸格式错误: %s (应形如 1280x720，且宽高为偶数)", optarg);
                 return 1;
             }
             break;
@@ -631,6 +723,7 @@ static void play_usage(void)
         "用法: vaapi_demo play [选项]\n"
         "\n"
         "  -i, --input <文件>        输入视频（默认 samples/%s）\n"
+        "  -S, --scale <宽x高>       解码后用 VPP 缩放显示，例如 1280x720\n"
         "      --loop                循环播放\n"
         "  -d, --device <节点>       DRM 设备\n"
         "      --connection-type <t> drm(默认) / x11\n"
@@ -648,10 +741,13 @@ static int command_play(int argc, char **argv)
     const char *device = NULL;
     const char *connection_type = "drm";
     char sample_path[4096];
+    int scale_width = 0;
+    int scale_height = 0;
     int loop = 0;
     int c;
     static const struct option options[] = {
         { "input",           required_argument, NULL, 'i' },
+        { "scale",           required_argument, NULL, 'S' },
         { "loop",            no_argument,       NULL, 1000 },
         { "device",          required_argument, NULL, 'd' },
         { "connection-type", required_argument, NULL, 1001 },
@@ -659,9 +755,16 @@ static int command_play(int argc, char **argv)
         { NULL, 0, NULL, 0 }
     };
 
-    while ((c = getopt_long(argc, argv, "i:d:h", options, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "i:S:d:h", options, NULL)) != -1) {
         switch (c) {
         case 'i': input = optarg; break;
+        case 'S':
+            if (vaapi_parse_size(optarg, &scale_width, &scale_height) < 0 ||
+                (scale_width & 1) || (scale_height & 1)) {
+                LOG_ERROR("缩放尺寸格式错误: %s (应形如 1280x720，且宽高为偶数)", optarg);
+                return 1;
+            }
+            break;
         case 1000: loop = 1; break;
         case 'd': device = optarg; break;
         case 1001: connection_type = optarg; break;
@@ -691,6 +794,8 @@ static int command_play(int argc, char **argv)
     config.connection_type = connection_type;
     config.want_hw_frames  = 0;
     config.out_format      = AV_PIX_FMT_NV12;   /* 显示模块按 NV12 上传纹理 */
+    config.scale_width     = scale_width;
+    config.scale_height    = scale_height;
 
     if (vaapi_decoder_open(&decoder, input, &config) < 0)
         return 1;
@@ -738,6 +843,8 @@ typedef struct {
     int bitrate_kbps;
     int gop;
     int bframes;
+    int scale_width;
+    int scale_height;
     int want_zero_copy;
     int zero_copy_used;
     int frames;
@@ -804,6 +911,7 @@ static void transcode_usage(void)
         "  -b, --bitrate <kbps>      目标码率（默认使用恒定质量）\n"
         "      --qp <0-51>           恒定质量 QP，默认 26\n"
         "  -g, --gop <帧数>          关键帧间隔，默认等于帧率\n"
+        "  -S, --scale <宽x高>       解码后用 VPP 缩放再编码，例如 1280x720\n"
         "      --max-frames <N>      只转码前 N 帧\n"
         "      --no-zero-copy        强制采用 CPU 中转（用于对比零拷贝开销）\n"
         "  -d, --device <节点>       DRM 设备\n"
@@ -825,6 +933,8 @@ static int command_transcode(int argc, char **argv)
     char default_output[64];
     int quiet = 0;
     int max_frames = 0;
+    int scale_width = 0;
+    int scale_height = 0;
     int c;
     int ret;
     int64_t start_us;
@@ -835,6 +945,7 @@ static int command_transcode(int argc, char **argv)
         { "bitrate",         required_argument, NULL, 'b' },
         { "qp",              required_argument, NULL, 1000 },
         { "gop",             required_argument, NULL, 'g' },
+        { "scale",           required_argument, NULL, 'S' },
         { "max-frames",      required_argument, NULL, 1001 },
         { "no-zero-copy",    no_argument,       NULL, 1002 },
         { "device",          required_argument, NULL, 'd' },
@@ -850,7 +961,7 @@ static int command_transcode(int argc, char **argv)
     state.bframes        = 3;
     state.want_zero_copy = 1;
 
-    while ((c = getopt_long(argc, argv, "i:o:c:b:g:d:qh", options, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "i:o:c:b:g:S:d:qh", options, NULL)) != -1) {
         switch (c) {
         case 'i': input = optarg; break;
         case 'o': output = optarg; break;
@@ -858,6 +969,13 @@ static int command_transcode(int argc, char **argv)
         case 'b': state.bitrate_kbps = atoi(optarg); break;
         case 1000: state.qp = atoi(optarg); break;
         case 'g': state.gop = atoi(optarg); break;
+        case 'S':
+            if (vaapi_parse_size(optarg, &scale_width, &scale_height) < 0 ||
+                (scale_width & 1) || (scale_height & 1)) {
+                LOG_ERROR("缩放尺寸格式错误: %s (应形如 1280x720，且宽高为偶数)", optarg);
+                return 1;
+            }
+            break;
         case 1001: max_frames = atoi(optarg); break;
         case 1002: state.want_zero_copy = 0; break;
         case 'd': device = optarg; break;
@@ -891,6 +1009,8 @@ static int command_transcode(int argc, char **argv)
     config.want_hw_frames  = state.want_zero_copy;
     config.out_format      = AV_PIX_FMT_NV12;
     config.max_frames      = max_frames;
+    config.scale_width     = scale_width;
+    config.scale_height    = scale_height;
 
     if (vaapi_decoder_open(&state.decoder, input, &config) < 0)
         return 1;
@@ -916,7 +1036,13 @@ static int command_transcode(int argc, char **argv)
         LOG_INFO("输入文件 : %s", input);
         LOG_INFO("输出文件 : %s", output);
         LOG_INFO("解码器   : %s (VAAPI) | %dx%d | %.2f fps", vaapi_decoder_codec_name(state.decoder),
-                 state.width, state.height, vaapi_decoder_fps(state.decoder));
+                 vaapi_decoder_source_width(state.decoder), vaapi_decoder_source_height(state.decoder),
+                 vaapi_decoder_fps(state.decoder));
+        if (scale_width > 0)
+            LOG_INFO("VPP 缩放 : %dx%d -> %dx%d (GPU VideoProc)",
+                     vaapi_decoder_source_width(state.decoder),
+                     vaapi_decoder_source_height(state.decoder),
+                     state.width, state.height);
     }
 
     start_us = util_now_us();
@@ -1063,15 +1189,15 @@ static int command_selftest(int argc, char **argv)
 
     LOG_INFO("================ VAAPI 全流程自检 ================");
 
-    LOG_INFO("[1/5] 检查 VAAPI 设备 ...");
+    LOG_INFO("[1/6] 检查 VAAPI 设备 ...");
     {
         AVBufferRef *device_ctx = vaapi_device_create(device, connection_type);
         if (!device_ctx) {
-            LOG_ERROR("[1/5] 失败: VAAPI 设备不可用");
+            LOG_ERROR("[1/6] 失败: VAAPI 设备不可用");
             return 1;
         }
         av_buffer_unref(&device_ctx);
-        LOG_INFO("[1/5] 通过");
+        LOG_INFO("[1/6] 通过");
     }
 
     memset(&encode, 0, sizeof(encode));
@@ -1088,12 +1214,12 @@ static int command_selftest(int argc, char **argv)
     encode.pix_fmt         = AV_PIX_FMT_YUV420P;
     encode.quiet           = quiet;
 
-    LOG_INFO("[2/5] 硬件编码 %s -> %s ...", encode.input, encode.output);
+    LOG_INFO("[2/6] 硬件编码 %s -> %s ...", encode.input, encode.output);
     if (run_encode(&encode, &encode_stats) < 0) {
-        LOG_ERROR("[2/5] 失败: 硬件编码失败");
+        LOG_ERROR("[2/6] 失败: 硬件编码失败");
         return 1;
     }
-    LOG_INFO("[2/5] 通过 (%d 帧, %.1f fps)", encode_stats.frames,
+    LOG_INFO("[2/6] 通过 (%d 帧, %.1f fps)", encode_stats.frames,
              encode_stats.seconds > 0 ? encode_stats.frames / encode_stats.seconds : 0.0);
 
     memset(&decode, 0, sizeof(decode));
@@ -1104,31 +1230,31 @@ static int command_selftest(int argc, char **argv)
     decode.out_format      = AV_PIX_FMT_YUV420P;
     decode.quiet           = quiet;
 
-    LOG_INFO("[3/5] 硬件解码 %s -> %s ...", decode.input, decode.output);
+    LOG_INFO("[3/6] 硬件解码 %s -> %s ...", decode.input, decode.output);
     if (run_decode(&decode, &decode_stats) < 0) {
-        LOG_ERROR("[3/5] 失败: 硬件解码失败");
+        LOG_ERROR("[3/6] 失败: 硬件解码失败");
         return 1;
     }
-    LOG_INFO("[3/5] 通过 (%d 帧, %.1f fps)", decode_stats.frames,
+    LOG_INFO("[3/6] 通过 (%d 帧, %.1f fps)", decode_stats.frames,
              decode_stats.seconds > 0 ? decode_stats.frames / decode_stats.seconds : 0.0);
 
-    LOG_INFO("[4/5] 画质校验（编码前 vs 解码后 PSNR）...");
+    LOG_INFO("[4/6] 画质校验（编码前 vs 解码后 PSNR）...");
     psnr = compare_yuv_files(encode.input, decode.output, encode.width, encode.height,
                              encode_stats.frames, &compared);
     if (compared <= 0) {
-        LOG_ERROR("[4/5] 失败: 无法比较 YUV 数据");
+        LOG_ERROR("[4/6] 失败: 无法比较 YUV 数据");
         return 1;
     }
-    LOG_INFO("[4/5] 对比 %d 帧, PSNR = %.2f dB %s", compared, psnr,
+    LOG_INFO("[4/6] 对比 %d 帧, PSNR = %.2f dB %s", compared, psnr,
              psnr >= 30.0 ? "(通过)" : "(偏低，请检查显卡状态)");
     if (psnr < 30.0) {
-        LOG_ERROR("[4/5] 失败: PSNR 过低");
+        LOG_ERROR("[4/6] 失败: PSNR 过低");
         return 1;
     }
 
-    LOG_INFO("[5/5] 解码示例视频 %s ...", SAMPLE_MP4);
+    LOG_INFO("[5/6] 解码示例视频 %s ...", SAMPLE_MP4);
     if (!util_find_sample(SAMPLE_MP4, mp4_path, sizeof(mp4_path))) {
-        LOG_WARN("[5/5] 跳过: 找不到 samples/%s", SAMPLE_MP4);
+        LOG_WARN("[5/6] 跳过: 找不到 samples/%s", SAMPLE_MP4);
     } else {
         memset(&decode, 0, sizeof(decode));
         decode.input           = mp4_path;
@@ -1139,11 +1265,49 @@ static int command_selftest(int argc, char **argv)
         decode.max_frames      = 30;
         decode.quiet           = quiet;
         if (run_decode(&decode, &decode_stats) < 0) {
-            LOG_ERROR("[5/5] 失败: 示例视频解码失败");
+            LOG_ERROR("[5/6] 失败: 示例视频解码失败");
             return 1;
         }
-        LOG_INFO("[5/5] 通过 (%d 帧, %.1f fps)", decode_stats.frames,
+        LOG_INFO("[5/6] 通过 (%d 帧, %.1f fps)", decode_stats.frames,
                  decode_stats.seconds > 0 ? decode_stats.frames / decode_stats.seconds : 0.0);
+    }
+
+    LOG_INFO("[6/6] VPP 缩放：编码 1920x1080 -> 1280x720，再解码 1280x720 -> 640x360 ...");
+    {
+        int64_t expected;
+        int64_t actual;
+
+        encode.output      = "output/selftest_scaled.h264";
+        encode.scale_width = 1280;
+        encode.scale_height = 720;
+        if (run_encode(&encode, &encode_stats) < 0) {
+            LOG_ERROR("[6/6] 失败: 编码前 VPP 缩放失败");
+            return 1;
+        }
+
+        memset(&decode, 0, sizeof(decode));
+        decode.input           = encode.output;
+        decode.output          = "output/selftest_scaled.yuv";
+        decode.device          = device;
+        decode.connection_type = connection_type;
+        decode.out_format      = AV_PIX_FMT_YUV420P;
+        decode.scale_width     = 640;
+        decode.scale_height    = 360;
+        decode.quiet           = quiet;
+        if (run_decode(&decode, &decode_stats) < 0) {
+            LOG_ERROR("[6/6] 失败: 解码后 VPP 缩放失败");
+            return 1;
+        }
+
+        expected = (int64_t)decode.scale_width * decode.scale_height * 3 / 2 * decode_stats.frames;
+        actual   = util_file_size(decode.output);
+        if (decode_stats.frames <= 0 || actual != expected) {
+            LOG_ERROR("[6/6] 失败: 缩放输出尺寸不符 (期望 %lld 字节, 实际 %lld 字节)",
+                      (long long)expected, (long long)actual);
+            return 1;
+        }
+        LOG_INFO("[6/6] 通过 (%d 帧, 输出 %dx%d)", decode_stats.frames,
+                 decode.scale_width, decode.scale_height);
     }
 
     LOG_INFO("==================================================");

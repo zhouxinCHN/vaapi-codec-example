@@ -11,9 +11,13 @@
 | `info` | 查看驱动、VA-API 版本、显卡支持的 profile/entrypoint、FFmpeg 硬件编解码器 |
 | `encode` | 硬件编码：YUV（I420/NV12）→ H.264 / H.265，支持 CQP 与 VBR 两种码控 |
 | `decode` | 硬件解码：MP4 / H.264 / H.265 → YUV（NV12 或 I420），可存首帧截图 |
+| VPP 缩放 | 编码前 / 解码后 / 转码中调用 VAAPI VideoProc 在显存内缩放（`-S 1280x720`） |
 | `play` | 解码后 OpenGL 实时播放（编译期检测到 glfw3 才启用） |
 | `transcode` | 解码 → 编码，默认零拷贝：帧数据全程留在显存 |
 | `selftest` | 一键自检：编码 → 解码 → PSNR 比对，判定整条硬件链路是否正常 |
+
+VPP 走 FFmpeg 的 `scale_vaapi` 过滤器（VAAPI VideoProc 通道），输入输出都是硬件帧，
+缩放过程不把画面拷回 CPU。
 
 本机实测（AMD Radeon RX 7900 XTX，1920×1080）：编码约 205 fps，解码约 100–140 fps，
 零拷贝转码约 390–460 fps（同场景 CPU 中转仅 158 fps），编解码往返 PSNR 37.9 dB。
@@ -28,7 +32,7 @@
 # Ubuntu / Kylin
 sudo apt install build-essential cmake pkg-config vainfo \
                  libva-dev libva-drm2 libdrm-dev \
-                 libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
+                 libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev libswscale-dev
 sudo apt install libglfw3-dev        # 可选：播放功能
 
 vainfo                               # 先确认驱动可用
@@ -66,10 +70,13 @@ vaapi_demo info
 vaapi_demo encode                                   # 示例 YUV -> output/encoded.h264
 vaapi_demo encode -c hevc -b 4000                   # H.265，4Mbps 码率控制
 vaapi_demo encode -i in.nv12 -p nv12 -s 1280x720    # 指定输入格式与分辨率
+vaapi_demo encode -S 1280x720                       # 编码前用 VPP 缩放到 720p
 vaapi_demo decode --snapshot first.ppm              # 解码并保存首帧，便于无界面环境查看
 vaapi_demo decode -p nv12 --max-frames 60           # 只解前 60 帧
+vaapi_demo decode -S 640x360 --snapshot small.ppm   # 解码后 VPP 缩放到 360p
 vaapi_demo play -i samples/video1080.mp4
 vaapi_demo transcode -c hevc -o output/out.h265     # 零拷贝转码
+vaapi_demo transcode -S 1280x720                    # 转码同时缩放到 720p
 vaapi_demo transcode --no-zero-copy                 # CPU 中转，用于性能对比
 vaapi_demo selftest
 ```
@@ -83,6 +90,7 @@ vaapi_demo selftest
 | `-c h264\|hevc` | 编解码格式，默认 h264 |
 | `-b <kbps>` / `--qp <n>` | 码率控制（VBR）/ 恒定质量，默认 CQP 26 |
 | `-g <帧数>`、`--bframes <n>` | GOP、连续 B 帧（默认等于帧率、3） |
+| `-S, --scale <宽x高>` | VPP 缩放目标尺寸，如 `1280x720`（默认不缩放，宽高需为偶数） |
 | `--max-frames <n>` | 只处理前 n 帧 |
 | `-d <节点>`、`--connection-type drm\|x11` | 多显卡指定设备；默认 drm，适合无界面服务器 |
 
@@ -110,6 +118,15 @@ av_hwframe_get_buffer + av_hwframe_transfer_data    内存图像上传到 GPU
 avcodec_send_frame / avcodec_receive_packet         取回码流
 ```
 
+VPP 缩放调用 VAAPI 的 VideoProc 通道（`scale_vaapi`），编码前 / 解码后都只是在显存里
+接一个缩放环节，不引入额外的内存往返：
+
+```c
+VaapiVpp *vpp = vaapi_vpp_create(device_ctx, NULL, 1920, 1080, 1280, 720, 25);
+AVFrame *scaled = NULL;
+vaapi_vpp_process(vpp, hw_frame_1080p, &scaled);   /* 输出 1280x720 硬件帧 */
+```
+
 零拷贝转码直接复用解码器的设备与帧池，编码器不再自己建池：
 
 ```c
@@ -123,7 +140,8 @@ config.hw_frames_ctx = frame->hw_frames_ctx;   /* 解码输出帧自带帧池 */
 |------|------|
 | `src/vaapi_encoder.c` | 硬件编码封装，可独立复用 |
 | `src/vaapi_decoder.c` | 硬件解码封装，可独立复用 |
-| `src/vaapi_common.c` | 设备创建（DRM）、错误码转换 |
+| `src/vaapi_vpp.c` | VPP 缩放封装（scale_vaapi / VideoProc） |
+| `src/vaapi_common.c` | 设备创建（DRM）、图像上传、错误码转换 |
 | `src/vaapi_info.c` | 驱动与显卡能力自检 |
 | `src/main.c` | 命令行入口与各子命令，含零拷贝转码实现 |
 | `src/renderer.c` | OpenGL NV12 显示（可选） |
@@ -157,4 +175,5 @@ config.hw_frames_ctx = frame->hw_frames_ctx;   /* 解码输出帧自带帧池 */
 
 ## 版本
 
-vaapi_demo 1.0.0，已验证 FFmpeg 7.1 / libva 1.20 / Mesa 25.2（AMD RX 7900 XTX）/ Ubuntu 24.04。
+vaapi_demo 1.0.0，已验证 FFmpeg 7.1（含 libavfilter/scale_vaapi）/ libva 1.20 /
+Mesa 25.2（AMD RX 7900 XTX）/ Ubuntu 24.04。

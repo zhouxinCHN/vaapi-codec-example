@@ -25,6 +25,7 @@ pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
     libavcodec
     libavformat
     libavutil
+    libavfilter
     libswscale
 )
 
@@ -43,6 +44,7 @@ set(VAAPI_DEMO_SOURCES
     src/vaapi_encoder.c
     src/vaapi_decoder.c
     src/vaapi_info.c
+    src/vaapi_vpp.c
     src/renderer.c
 )
 

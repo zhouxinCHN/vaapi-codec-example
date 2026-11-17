@@ -8,6 +8,8 @@
 #include <libavutil/pixdesc.h>
 #include <libswscale/swscale.h>
 
+#include "vaapi_vpp.h"
+
 struct VaapiDecoder {
     AVFormatContext *format_ctx;
     AVCodecContext *avctx;
@@ -19,6 +21,8 @@ struct VaapiDecoder {
     enum AVPixelFormat sw_format;
     int width;
     int height;
+    int out_width;
+    int out_height;
     double fps;
     int64_t frame_count;
     double duration;
@@ -29,6 +33,7 @@ struct VaapiDecoder {
     int max_frames;
     int frames_decoded;
 
+    VaapiVpp *vpp;
     AVFrame *sw_frame;
     struct SwsContext *sws;
     AVFrame *convert_frame;
@@ -161,6 +166,25 @@ int vaapi_decoder_open(VaapiDecoder **decoder, const char *path,
     else
         dec->sw_format = AV_PIX_FMT_NV12;
 
+    dec->out_width  = dec->width;
+    dec->out_height = dec->height;
+
+    /* 解码后 VPP 缩放：接一层 scale_vaapi，帧数据不回到 CPU */
+    if (config && config->scale_width > 0 && config->scale_height > 0) {
+        dec->vpp = vaapi_vpp_create(dec->device_ctx, dec->avctx->hw_frames_ctx,
+                                    dec->width, dec->height,
+                                    config->scale_width, config->scale_height,
+                                    (int)(dec->fps + 0.5));
+        if (!dec->vpp) {
+            LOG_ERROR("初始化解码后 VPP 缩放失败 (%dx%d -> %dx%d)",
+                      dec->width, dec->height, config->scale_width, config->scale_height);
+            ret = AVERROR_EXTERNAL;
+            goto fail;
+        }
+        dec->out_width  = config->scale_width;
+        dec->out_height = config->scale_height;
+    }
+
     *decoder = dec;
     return 0;
 
@@ -174,6 +198,8 @@ void vaapi_decoder_close(VaapiDecoder *decoder)
     if (!decoder)
         return;
 
+    if (decoder->vpp)
+        vaapi_vpp_free(decoder->vpp);
     if (decoder->sws)
         sws_freeContext(decoder->sws);
     if (decoder->sw_frame)
@@ -188,33 +214,53 @@ void vaapi_decoder_close(VaapiDecoder *decoder)
     free(decoder);
 }
 
-/* 把硬件帧取回内存并按需要转换格式，然后交给上层 */
+/*
+ * 处理一帧解码结果：
+ *   1. 若启用 VPP，先在显存内完成缩放；
+ *   2. 需要硬件帧（零拷贝转码）直接回调，否则取回内存并按需转换颜色格式。
+ */
 static int deliver_frame(VaapiDecoder *dec, AVFrame *hw_frame,
                          VaapiFrameHandler handler, void *opaque)
 {
+    AVFrame *scaled = NULL;
+    AVFrame *source = hw_frame;
     int ret;
 
-    if (dec->want_hw_frames)
-        return handler(opaque, hw_frame);
+    if (dec->vpp) {
+        ret = vaapi_vpp_process(dec->vpp, hw_frame, &scaled);
+        if (ret < 0) {
+            LOG_ERROR("VPP 缩放失败: %s", vaapi_error_string(ret));
+            return ret;
+        }
+        source = scaled;
+    }
+
+    if (dec->want_hw_frames) {
+        ret = handler(opaque, source);   /* 零拷贝：直接把硬件帧交给上层 */
+        av_frame_free(&scaled);
+        return ret;
+    }
 
     if (!dec->sw_frame) {
         dec->sw_frame = av_frame_alloc();
-        if (!dec->sw_frame)
+        if (!dec->sw_frame) {
+            av_frame_free(&scaled);
             return AVERROR(ENOMEM);
+        }
     }
     av_frame_unref(dec->sw_frame);
 
-    ret = av_hwframe_transfer_data(dec->sw_frame, hw_frame, 0);
+    ret = av_hwframe_transfer_data(dec->sw_frame, source, 0);
     if (ret < 0) {
         LOG_ERROR("从显存取回帧数据失败: %s", vaapi_error_string(ret));
+        av_frame_free(&scaled);
         return ret;
     }
-    dec->sw_frame->pts = hw_frame->pts;
+    dec->sw_frame->pts = source->pts;
+    av_frame_free(&scaled);
 
-    if (dec->out_format == AV_PIX_FMT_NONE || dec->sw_frame->format == dec->out_format) {
-        ret = handler(opaque, dec->sw_frame);
-        return ret;
-    }
+    if (dec->out_format == AV_PIX_FMT_NONE || dec->sw_frame->format == dec->out_format)
+        return handler(opaque, dec->sw_frame);
 
     /* 需要做颜色格式转换（例如 NV12 -> I420，便于和原始 YUV 文件对比） */
     if (!dec->sws || dec->sws_src_format != dec->sw_frame->format ||
@@ -232,6 +278,7 @@ static int deliver_frame(VaapiDecoder *dec, AVFrame *hw_frame,
         dec->sws_src_format = dec->sw_frame->format;
         dec->sws_width      = dec->sw_frame->width;
         dec->sws_height     = dec->sw_frame->height;
+        av_frame_free(&dec->convert_frame);   /* 尺寸可能变化，重新分配 */
     }
 
     if (!dec->convert_frame) {
@@ -249,7 +296,7 @@ static int deliver_frame(VaapiDecoder *dec, AVFrame *hw_frame,
 
     sws_scale(dec->sws, (const uint8_t * const *)dec->sw_frame->data, dec->sw_frame->linesize,
               0, dec->sw_frame->height, dec->convert_frame->data, dec->convert_frame->linesize);
-    dec->convert_frame->pts = hw_frame->pts;
+    dec->convert_frame->pts = dec->sw_frame->pts;
 
     return handler(opaque, dec->convert_frame);
 }
@@ -335,10 +382,20 @@ int vaapi_decoder_decode(VaapiDecoder *dec, VaapiFrameHandler handler, void *opa
 
 int vaapi_decoder_width(const VaapiDecoder *decoder)
 {
-    return decoder ? decoder->width : 0;
+    return decoder ? decoder->out_width : 0;
 }
 
 int vaapi_decoder_height(const VaapiDecoder *decoder)
+{
+    return decoder ? decoder->out_height : 0;
+}
+
+int vaapi_decoder_source_width(const VaapiDecoder *decoder)
+{
+    return decoder ? decoder->width : 0;
+}
+
+int vaapi_decoder_source_height(const VaapiDecoder *decoder)
 {
     return decoder ? decoder->height : 0;
 }

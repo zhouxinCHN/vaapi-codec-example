@@ -48,4 +48,14 @@ AVBufferRef *vaapi_device_create(const char *device, const char *connection_type
  */
 int vaapi_parse_size(const char *text, int *width, int *height);
 
+/* 从帧池申请一帧 VAAPI 硬件帧，用完 av_frame_free。 */
+AVFrame *vaapi_frame_alloc_hw(AVBufferRef *hw_frames_ctx);
+
+/*
+ * 把系统内存帧上传到 VAAPI 表面。
+ * 若输入格式/尺寸与帧池不一致，会先用 swscale 做一次转换（例如 I420 -> NV12）。
+ * 成功返回新申请的硬件帧（用完 av_frame_free），失败返回 NULL。
+ */
+AVFrame *vaapi_frame_upload(AVBufferRef *hw_frames_ctx, AVFrame *sw_frame);
+
 #endif /* VAAPI_COMMON_H */

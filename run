@@ -87,6 +87,10 @@ run_item() {
             "$BIN" selftest
             ;;
         9)
+            section "VPP 缩放：编码前用显卡 VideoProc 把 1920x1080 缩到 1280x720"
+            "$BIN" encode -S 1280x720 -o output/scaled.h264
+            ;;
+        0)
             "$BIN" --help
             ;;
         *)
@@ -99,7 +103,7 @@ run_item() {
 # 命令行透传：./run selftest / ./run encode -c hevc ...
 if [ $# -gt 0 ]; then
     case "$1" in
-        [1-9])
+        [0-9])
             if [ $# -eq 1 ]; then
                 run_item "$1"
                 exit $?
@@ -118,7 +122,7 @@ clear 2>/dev/null || true
 cat <<'EOF'
 ================================================================
              VAAPI 硬件编解码 Demo  (vaapi_demo)
-        —— 显卡硬件编码 / 解码 / 零拷贝转码 一键体验 ——
+        —— 硬件编码 / 解码 / 零拷贝转码 / VPP 缩放 一键体验 ——
 ================================================================
 EOF
 "$BIN" info 2>/dev/null | head -4
@@ -134,10 +138,11 @@ while true; do
   6) 零拷贝转码 MP4 ->  H.264
   7) 零拷贝转码 MP4 ->  H.265
   8) 一键全流程自检（编码->解码->PSNR）
-  9) 查看完整帮助
+  9) VPP 缩放编码（1080p -> 720p，GPU 内完成）
+  0) 查看完整帮助
   q) 退出
 EOF
-    printf '\n请选择 [1-9/q]: '
+    printf '\n请选择 [0-9/q]: '
     read -r choice || exit 0
 
     case "$choice" in
@@ -145,7 +150,7 @@ EOF
             echo "再见！"
             exit 0
             ;;
-        [1-9])
+        [0-9])
             run_item "$choice"
             pause
             clear 2>/dev/null || true

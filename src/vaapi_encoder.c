@@ -6,7 +6,6 @@
 
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
-#include <libswscale/swscale.h>
 
 struct VaapiEncoder {
     AVCodecContext *avctx;
@@ -273,19 +272,9 @@ void vaapi_encoder_close(VaapiEncoder *encoder)
 
 AVFrame *vaapi_encoder_alloc_hw_frame(VaapiEncoder *encoder)
 {
-    AVFrame *frame;
-
-    if (!encoder || !encoder->frames_ctx)
+    if (!encoder)
         return NULL;
-
-    frame = av_frame_alloc();
-    if (!frame)
-        return NULL;
-    if (av_hwframe_get_buffer(encoder->frames_ctx, frame, 0) < 0) {
-        av_frame_free(&frame);
-        return NULL;
-    }
-    return frame;
+    return vaapi_frame_alloc_hw(encoder->frames_ctx);
 }
 
 int vaapi_encoder_send(VaapiEncoder *encoder, AVFrame *frame,
@@ -311,82 +300,23 @@ int vaapi_encoder_send(VaapiEncoder *encoder, AVFrame *frame,
     return drain_encoder(encoder, writer, opaque);
 }
 
-/* 当输入格式与帧池格式不一致时，先在 CPU 侧做一次颜色格式转换。 */
-static AVFrame *convert_to_format(AVFrame *src, enum AVPixelFormat target)
-{
-    struct SwsContext *sws;
-    AVFrame *dst;
-
-    dst = av_frame_alloc();
-    if (!dst)
-        return NULL;
-    dst->format = target;
-    dst->width  = src->width;
-    dst->height = src->height;
-    if (av_frame_get_buffer(dst, 32) < 0) {
-        av_frame_free(&dst);
-        return NULL;
-    }
-
-    sws = sws_getContext(src->width, src->height, (enum AVPixelFormat)src->format,
-                         dst->width, dst->height, target,
-                         SWS_BILINEAR, NULL, NULL, NULL);
-    if (!sws) {
-        av_frame_free(&dst);
-        return NULL;
-    }
-    sws_scale(sws, (const uint8_t * const *)src->data, src->linesize, 0, src->height,
-              dst->data, dst->linesize);
-    sws_freeContext(sws);
-    return dst;
-}
-
 int vaapi_encoder_send_sw(VaapiEncoder *encoder, AVFrame *frame,
                           VaapiPacketWriter writer, void *opaque)
 {
-    AVHWFramesContext *frames;
     AVFrame *hw_frame;
-    AVFrame *converted = NULL;
-    AVFrame *input = frame;
     int ret;
 
     if (!encoder || !frame)
         return AVERROR(EINVAL);
 
-    frames = (AVHWFramesContext *)encoder->frames_ctx->data;
-
-    if (frame->width != frames->width || frame->height != frames->height ||
-        frame->format != frames->sw_format) {
-        converted = convert_to_format(frame, frames->sw_format);
-        if (!converted) {
-            LOG_ERROR("转换输入帧格式失败 (%s -> %s)",
-                      av_get_pix_fmt_name(frame->format),
-                      av_get_pix_fmt_name(frames->sw_format));
-            return AVERROR_EXTERNAL;
-        }
-        input = converted;
-    }
-
-    hw_frame = vaapi_encoder_alloc_hw_frame(encoder);
-    if (!hw_frame) {
-        av_frame_free(&converted);
-        return AVERROR(ENOMEM);
-    }
-
-    ret = av_hwframe_transfer_data(hw_frame, input, 0);
-    if (ret < 0) {
-        LOG_ERROR("上传图像到显卡失败: %s", vaapi_error_string(ret));
-        av_frame_free(&hw_frame);
-        av_frame_free(&converted);
-        return ret;
-    }
-    hw_frame->pts = input->pts;
-    hw_frame->duration = input->duration;
+    /* 上传到 GPU（格式/尺寸不一致时自动在 CPU 侧转换，如 I420 -> NV12） */
+    hw_frame = vaapi_frame_upload(encoder->frames_ctx, frame);
+    if (!hw_frame)
+        return AVERROR_EXTERNAL;
 
     ret = vaapi_encoder_send(encoder, hw_frame, writer, opaque);
 
     av_frame_free(&hw_frame);
-    av_frame_free(&converted);
     return ret;
 }
 

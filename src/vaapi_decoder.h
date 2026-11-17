@@ -25,6 +25,8 @@ typedef struct {
     int want_hw_frames;              /* 1: 输出 VAAPI 硬件帧（零拷贝） */
     enum AVPixelFormat out_format;   /* 软件帧格式：I420 / NV12；AV_PIX_FMT_NONE 保持解码器原生格式 */
     int max_frames;                  /* 最多解码多少帧，0 表示全部 */
+    int scale_width;                 /* VPP 缩放目标宽，0 表示不缩放 */
+    int scale_height;                /* VPP 缩放目标高，0 表示不缩放 */
 } VaapiDecoderConfig;
 
 /* 帧回调：返回 0 继续解码，返回负值中止。frame 的生命周期仅限回调内。 */
@@ -35,8 +37,12 @@ int vaapi_decoder_open(VaapiDecoder **decoder, const char *path,
 int vaapi_decoder_decode(VaapiDecoder *decoder, VaapiFrameHandler handler, void *opaque);
 void vaapi_decoder_close(VaapiDecoder *decoder);
 
+/* 输出尺寸：启用 VPP 缩放时返回缩放后的尺寸 */
 int vaapi_decoder_width(const VaapiDecoder *decoder);
 int vaapi_decoder_height(const VaapiDecoder *decoder);
+/* 解码器原始尺寸（缩放前） */
+int vaapi_decoder_source_width(const VaapiDecoder *decoder);
+int vaapi_decoder_source_height(const VaapiDecoder *decoder);
 double vaapi_decoder_fps(const VaapiDecoder *decoder);
 int64_t vaapi_decoder_frame_count(const VaapiDecoder *decoder);
 double vaapi_decoder_duration(const VaapiDecoder *decoder);

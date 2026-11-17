@@ -1,0 +1,22 @@
+# 构建 / 安装 / 运行产物
+build/
+install/
+output/
+*.o
+*.a
+*.so
+compile_commands.json
+
+# 原始 YUV 素材体积过大（约 63MB），不纳入仓库，
+# 需要时执行 samples/make_sample.sh 生成
+samples/*.yuv
+samples/*.nv12
+
+# 本地归档：整合前的原始 demo 与压缩包，仅本地保留
+legacy/
+
+# 编辑器 / 系统文件
+.vscode/
+.idea/
+*.swp
+.DS_Store

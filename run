@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+#
+# VAAPI 硬件编解码 Demo - 傻瓜式启动脚本
+#
+#   ./run                 交互菜单
+#   ./run 2               直接执行菜单第 2 项
+#   ./run selftest        透传任意子命令给 vaapi_demo
+#
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR" || exit 1
+
+# ---------------------------------------------------------------------------
+# 定位可执行文件：安装目录 -> 源码构建目录 -> PATH
+# ---------------------------------------------------------------------------
+find_binary() {
+    local candidates=(
+        "$SCRIPT_DIR/bin/vaapi_demo"
+        "$SCRIPT_DIR/build/bin/vaapi_demo"
+        "$SCRIPT_DIR/install/bin/vaapi_demo"
+    )
+    local candidate
+    for candidate in "${candidates[@]}"; do
+        if [ -x "$candidate" ]; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done
+    if command -v vaapi_demo >/dev/null 2>&1; then
+        command -v vaapi_demo
+        return 0
+    fi
+    return 1
+}
+
+BIN="$(find_binary)" || {
+    echo "错误: 找不到 vaapi_demo 可执行文件。"
+    echo "请先在项目目录执行:  make"
+    exit 1
+}
+
+pause() {
+    if [ -t 0 ]; then
+        printf '\n按回车键返回菜单...'
+        read -r _ || true
+    fi
+}
+
+section() {
+    printf '\n\033[1;36m%s\033[0m\n\n' "$1"
+}
+
+run_item() {
+    case "$1" in
+        1)
+            section "环境自检：驱动 / VA-API 能力 / FFmpeg 硬件编解码器"
+            "$BIN" info
+            ;;
+        2)
+            section "硬件编码：YUV(I420) -> H.264"
+            "$BIN" encode -c h264 -o output/encoded.h264
+            ;;
+        3)
+            section "硬件编码：YUV(I420) -> H.265"
+            "$BIN" encode -c hevc -o output/encoded.h265
+            ;;
+        4)
+            section "硬件解码：MP4 -> YUV（演示只解前 60 帧），并保存首帧截图"
+            "$BIN" decode -o output/decoded.i420.yuv --max-frames 60 \
+                          --snapshot output/first_frame.ppm
+            ;;
+        5)
+            section "硬件解码 + 实时播放（需要图形界面，按 ESC 或关闭窗口退出）"
+            "$BIN" play
+            ;;
+        6)
+            section "零拷贝转码：MP4 -> H.264（解码帧直接送编码器）"
+            "$BIN" transcode -c h264 -o output/transcoded.h264
+            ;;
+        7)
+            section "零拷贝转码：MP4 -> H.265"
+            "$BIN" transcode -c hevc -o output/transcoded.h265
+            ;;
+        8)
+            section "全流程自检：编码 -> 解码 -> PSNR 画质校验"
+            "$BIN" selftest
+            ;;
+        9)
+            "$BIN" --help
+            ;;
+        *)
+            echo "无效选项: $1"
+            return 1
+            ;;
+    esac
+}
+
+# 命令行透传：./run selftest / ./run encode -c hevc ...
+if [ $# -gt 0 ]; then
+    case "$1" in
+        [1-9])
+            if [ $# -eq 1 ]; then
+                run_item "$1"
+                exit $?
+            fi
+            ;;
+        *)
+            exec "$BIN" "$@"
+            ;;
+    esac
+fi
+
+# ---------------------------------------------------------------------------
+# 交互菜单
+# ---------------------------------------------------------------------------
+clear 2>/dev/null || true
+cat <<'EOF'
+================================================================
+             VAAPI 硬件编解码 Demo  (vaapi_demo)
+        —— 显卡硬件编码 / 解码 / 零拷贝转码 一键体验 ——
+================================================================
+EOF
+"$BIN" info 2>/dev/null | head -4
+
+while true; do
+    cat <<EOF
+
+  1) 环境自检（驱动 / 能力 / 支持列表）
+  2) 硬件编码  YUV  ->  H.264
+  3) 硬件编码  YUV  ->  H.265
+  4) 硬件解码  MP4  ->  YUV（含首帧截图）
+  5) 硬件解码并播放（窗口）
+  6) 零拷贝转码 MP4 ->  H.264
+  7) 零拷贝转码 MP4 ->  H.265
+  8) 一键全流程自检（编码->解码->PSNR）
+  9) 查看完整帮助
+  q) 退出
+EOF
+    printf '\n请选择 [1-9/q]: '
+    read -r choice || exit 0
+
+    case "$choice" in
+        q|Q|quit|exit)
+            echo "再见！"
+            exit 0
+            ;;
+        [1-9])
+            run_item "$choice"
+            pause
+            clear 2>/dev/null || true
+            ;;
+        "")
+            ;;
+        *)
+            echo "无效选项，请输入 1-9 或 q"
+            ;;
+    esac
+done

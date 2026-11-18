@@ -29,6 +29,7 @@
 #include "vaapi_common.h"
 #ifdef HAVE_EGL
 #include <glad/glad.h>
+#include "gl_vaapi.h"
 #endif
 #ifdef HAVE_EGL
 #include "egl_headless.h"
@@ -1455,6 +1456,210 @@ static int command_transcode(int argc, char **argv)
 }
 
 /* ------------------------------------------------------------------------- */
+/* GL 渲染结果零拷贝编码                                                       */
+/* ------------------------------------------------------------------------- */
+
+#ifdef HAVE_EGL
+typedef struct {
+    GlVaapiEncoder *encoder;
+    PacketSink *sink;
+    int64_t frames;
+    int failed;
+} GlEncodeState;
+
+static int gl_encode_handler(void *opaque, AVFrame *frame)
+{
+    GlEncodeState *state = opaque;
+    int ret;
+
+    ret = gl_vaapi_encode_frame(state->encoder, frame, state->frames,
+                                sink_write_packet, state->sink);
+    if (ret < 0) {
+        state->failed = 1;
+        return ret;
+    }
+    state->frames++;
+    return 0;
+}
+
+static void glencode_usage(void)
+{
+    fprintf(stdout,
+        "用法: vaapi_demo glencode [选项]\n"
+        "\n"
+        "  GL/EGL 渲染 -> dmabuf -> VAAPI 表面 -> 硬件编码，全程零拷贝。\n"
+        "  不给 -i 时生成动态测试图案；给了输入视频则先解码再合成（含 OSD 小方块）。\n"
+        "\n"
+        "  -i, --input <文件>        可选：先解码该视频作为 GL 合成输入\n"
+        "  -o, --output <文件>       输出码流，默认 output/gl_encoded.h264\n"
+        "  -c, --codec <h264|hevc>   编码格式，默认 h264\n"
+        "  -r, --fps <帧率>          默认 25（无输入时）或跟随输入\n"
+        "      --qp <0-51>           恒定质量 QP，默认 26\n"
+        "  -b, --bitrate <kbps>      目标码率\n"
+        "  -g, --gop <帧数>          关键帧间隔\n"
+        "      --frames <N>          无输入时生成的帧数，默认 60\n"
+        "  -d, --device <节点>       DRM 设备\n"
+        "      --connection-type <t> drm(默认) / x11\n"
+        "  -q, --quiet               精简输出\n"
+        "  -h, --help                显示帮助\n");
+}
+
+static int command_glencode(int argc, char **argv)
+{
+    GlVaapiConfig config;
+    GlVaapiEncoder *encoder = NULL;
+    VaapiDecoder *decoder = NULL;
+    FILE *output_file = NULL;
+    PacketSink sink = { 0 };
+    GlEncodeState state;
+    const char *input = NULL;
+    const char *output = "output/gl_encoded.h264";
+    const char *codec = "h264";
+    int width = 1920, height = 1080, fps = 25;
+    int qp = 26, bitrate = 0, gop = 0, frames = 60;
+    int frames_given = 0;
+    int quiet = 0;
+    int c, ret = -1;
+    int64_t start_us;
+    static const struct option options[] = {
+        { "input",           required_argument, NULL, 'i' },
+        { "output",          required_argument, NULL, 'o' },
+        { "codec",           required_argument, NULL, 'c' },
+        { "fps",             required_argument, NULL, 'r' },
+        { "qp",              required_argument, NULL, 1000 },
+        { "bitrate",         required_argument, NULL, 'b' },
+        { "gop",             required_argument, NULL, 'g' },
+        { "frames",          required_argument, NULL, 1001 },
+        { "device",          required_argument, NULL, 'd' },
+        { "connection-type", required_argument, NULL, 1002 },
+        { "quiet",           no_argument,       NULL, 'q' },
+        { "help",            no_argument,       NULL, 'h' },
+        { NULL, 0, NULL, 0 }
+    };
+
+    memset(&config, 0, sizeof(config));
+    while ((c = getopt_long(argc, argv, "i:o:c:r:b:g:d:qh", options, NULL)) != -1) {
+        switch (c) {
+        case 'i': input = optarg; break;
+        case 'o': output = optarg; break;
+        case 'c': codec = optarg; break;
+        case 'r': fps = atoi(optarg); break;
+        case 1000: qp = atoi(optarg); break;
+        case 'b': bitrate = atoi(optarg); break;
+        case 'g': gop = atoi(optarg); break;
+        case 1001: frames = atoi(optarg); frames_given = 1; break;
+        case 'd': config.device = optarg; break;
+        case 1002: config.connection_type = optarg; break;
+        case 'q': quiet = 1; break;
+        case 'h':
+        default:
+            glencode_usage();
+            return c == 'h' ? 0 : 1;
+        }
+    }
+    config.connection_type = config.connection_type ? config.connection_type : "drm";
+
+    if (!input) {
+        char sample[4096];
+        /* 未指定输入则用示例视频，便于对照；也支持 --frames 纯合成 */
+        if (util_find_sample(SAMPLE_MP4, sample, sizeof(sample)))
+            input = sample;
+        else
+            input = NULL;
+    }
+
+    if (input) {
+        VaapiDecoderConfig dcfg;
+
+        memset(&dcfg, 0, sizeof(dcfg));
+        dcfg.device          = config.device;
+        dcfg.connection_type = config.connection_type;
+        dcfg.want_hw_frames  = 1;
+        dcfg.out_format      = AV_PIX_FMT_NONE;
+        dcfg.max_frames      = frames_given ? frames : 0;
+        if (vaapi_decoder_open(&decoder, input, &dcfg) < 0)
+            return 1;
+        width  = vaapi_decoder_width(decoder) & ~1;
+        height = vaapi_decoder_height(decoder) & ~1;
+        fps    = (int)(vaapi_decoder_fps(decoder) + 0.5);
+        if (fps <= 0)
+            fps = 25;
+    }
+
+    ensure_parent_dir(output);
+    output_file = fopen(output, "wb");
+    if (!output_file) {
+        LOG_ERROR("无法创建输出文件 %s: %s", output, strerror(errno));
+        goto cleanup;
+    }
+
+    config.codec        = codec;
+    config.width        = width;
+    config.height       = height;
+    config.fps          = fps;
+    config.qp           = qp;
+    config.bitrate_kbps = bitrate;
+    config.gop          = gop;
+    if (gl_vaapi_open(&encoder, &config) < 0) {
+        LOG_ERROR("初始化 GL 零拷贝编码器失败");
+        goto cleanup;
+    }
+
+    if (!quiet) {
+        LOG_INFO("输入      : %s", input ? input : "(合成画面)");
+        LOG_INFO("输出      : %s", output);
+        LOG_INFO("GL 渲染器 : %s", gl_vaapi_renderer_name(encoder));
+        LOG_INFO("尺寸/帧率 : %dx%d @ %d fps", width, height, fps);
+    }
+
+    sink.file = output_file;
+    memset(&state, 0, sizeof(state));
+    state.encoder = encoder;
+    state.sink    = &sink;
+    start_us = util_now_us();
+
+    if (decoder) {
+        if (vaapi_decoder_decode(decoder, gl_encode_handler, &state) < 0 || state.failed)
+            goto cleanup;
+    } else {
+        for (int i = 0; i < frames; i++) {
+            if (gl_vaapi_encode_frame(encoder, NULL, i, sink_write_packet, &sink) < 0)
+                goto cleanup;
+            state.frames++;
+        }
+    }
+
+    if (gl_vaapi_flush(encoder, sink_write_packet, &sink) < 0)
+        goto cleanup;
+
+    {
+        double seconds = (util_now_us() - start_us) / 1000000.0;
+
+        LOG_INFO("----------------------------------------------");
+        LOG_INFO("GL 零拷贝编码完成: %d 帧, 输出 %s, %.1f fps, 平均码率 %s",
+                 (int)state.frames, util_format_size(sink.bytes),
+                 seconds > 0 ? state.frames / seconds : 0.0,
+                 util_format_bitrate(seconds > 0 ? sink.bytes * 8.0 / seconds : 0.0));
+    }
+    ret = 0;
+
+cleanup:
+    if (encoder)
+        gl_vaapi_close(encoder);
+    if (decoder)
+        vaapi_decoder_close(decoder);
+    if (output_file)
+        fclose(output_file);
+    if (ret < 0) {
+        LOG_ERROR("GL 零拷贝编码失败");
+        unlink(output);
+        return 1;
+    }
+    return 0;
+}
+#endif /* HAVE_EGL */
+
+/* ------------------------------------------------------------------------- */
 /* 自检                                                                       */
 /* ------------------------------------------------------------------------- */
 
@@ -1719,6 +1924,7 @@ static void print_usage(const char *program)
         "  play        硬件解码并实时显示（EGL + Wayland 窗口）\n"
         "  transcode   解码 + 编码转码，默认零拷贝（帧数据不出显存）\n"
         "  dmabuf      导出 DRM PRIME 并打印描述符，验证零拷贝到 GL 的导出接口\n"
+        "  glencode    GL/EGL 渲染结果零拷贝送入硬件编码器\n"
         "  selftest    一键全流程自检（编码 -> 解码 -> PSNR 校验）\n"
         "\n"
         "常用示例:\n"
@@ -1740,7 +1946,7 @@ int main(int argc, char **argv)
 {
     const char *command;
 
-    av_log_set_level(AV_LOG_WARNING);
+    av_log_set_level(getenv("VAAPI_DEBUG") ? AV_LOG_DEBUG : AV_LOG_WARNING);
 
     if (argc < 2) {
         print_usage(argv[0]);
@@ -1759,6 +1965,14 @@ int main(int argc, char **argv)
         return command_transcode(argc - 1, argv + 1);
     if (!strcmp(command, "dmabuf"))
         return command_dmabuf(argc - 1, argv + 1);
+    if (!strcmp(command, "glencode")) {
+#ifdef HAVE_EGL
+        return command_glencode(argc - 1, argv + 1);
+#else
+        LOG_ERROR("本版本编译时未启用 EGL，glencode 不可用");
+        return 1;
+#endif
+    }
     if (!strcmp(command, "selftest"))
         return command_selftest(argc - 1, argv + 1);
     if (!strcmp(command, "info")) {

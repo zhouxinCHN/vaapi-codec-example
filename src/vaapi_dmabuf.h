@@ -36,6 +36,9 @@ typedef struct {
  */
 int vaapi_dmabuf_export(AVFrame *hw_frame, VaapiDmabuf *dmabuf);
 
+/* writable != 0 时导出为可写表面（GL 渲染目标用）。 */
+int vaapi_dmabuf_export_ex(AVFrame *hw_frame, VaapiDmabuf *dmabuf, int writable);
+
 /* 释放导出结果并关闭所有 dmabuf fd。 */
 void vaapi_dmabuf_release(VaapiDmabuf *dmabuf);
 

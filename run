@@ -94,6 +94,10 @@ run_item() {
             section "零拷贝导出检查：VAAPI 表面 -> DRM PRIME(dmabuf)，无需显示环境"
             "$BIN" dmabuf --max-frames 3
             ;;
+        11)
+            section "GL 渲染零拷贝编码：GL 合成/OSD -> 编码器表面 -> 硬编"
+            "$BIN" glencode --frames 60 -o output/gl_encoded.h264
+            ;;
         0)
             "$BIN" --help
             ;;
@@ -107,7 +111,7 @@ run_item() {
 # 命令行透传：./run selftest / ./run encode -c hevc ...
 if [ $# -gt 0 ]; then
     case "$1" in
-        10|[0-9])
+        11|10|[0-9])
             if [ $# -eq 1 ]; then
                 run_item "$1"
                 exit $?
@@ -144,10 +148,11 @@ while true; do
   8) 一键全流程自检（编码->解码->PSNR）
   9) VPP 缩放编码（1080p -> 720p，GPU 内完成）
  10) 零拷贝导出检查（dmabuf，无需显示环境）
+ 11) GL 渲染零拷贝编码（GL -> 编码器表面 -> 硬编）
   0) 查看完整帮助
   q) 退出
 EOF
-    printf '\n请选择 [0-10/q]: '
+    printf '\n请选择 [0-11/q]: '
     read -r choice || exit 0
 
     case "$choice" in
@@ -155,7 +160,7 @@ EOF
             echo "再见！"
             exit 0
             ;;
-        10|[0-9])
+        11|10|[0-9])
             run_item "$choice"
             pause
             clear 2>/dev/null || true

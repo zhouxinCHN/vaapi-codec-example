@@ -13,6 +13,7 @@
 | `decode` | 硬件解码：MP4 / H.264 / H.265 → YUV（NV12 或 I420），可存首帧截图 |
 | VPP 缩放 | 编码前 / 解码后 / 转码中调用 VAAPI VideoProc 在显存内缩放（`-S 1280x720`） |
 | 零拷贝显示 | 解码帧导出 dmabuf → EGLImage → GL 纹理，画面不经过 CPU（`play --zero-copy`） |
+| GL 零拷贝编码 | GL/EGL 渲染结果直接写入编码器表面再编码（`glencode`），可做 GL 合成/OSD |
 | `play` | 解码后实时播放（EGL 窗口，支持 Wayland / X11 两种后端，`--zero-copy` 走 dmabuf） |
 | `transcode` | 解码 → 编码，默认零拷贝：帧数据全程留在显存 |
 | `selftest` | 一键自检：编码 → 解码 → PSNR 比对，判定整条硬件链路是否正常 |
@@ -87,6 +88,8 @@ vaapi_demo transcode --no-zero-copy                 # CPU 中转，用于性能�
 vaapi_demo selftest
 vaapi_demo dmabuf                                   # 导出 DRM PRIME 并打印描述符（无需显示环境）
 vaapi_demo dmabuf --gl                              # 无头环境下导入并读回比对（验证零拷贝链路）
+vaapi_demo glencode -o output/gl.h264               # GL 渲染（含 OSD）-> 编码，全程显存
+vaapi_demo glencode -c hevc --frames 60             # 纯合成画面 60 帧编码为 H.265
 ```
 
 常用选项：
@@ -160,6 +163,11 @@ glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, image);
 `EGL_DMA_BUF_PLANE0_MODIFIER_LO/HI_EXT` 一并传入；表面高度会按 16 像素对齐
 （1080 -> 1088），渲染时按可见尺寸裁剪。
 
+GL 零拷贝编码（`glencode`）反过来走：从编码器帧池取一块表面 → `vaExportSurfaceHandle`
+导出 dmabuf → EGL 导入成两张纹理（Y/UV）→ 作为 FBO 渲染目标 → GL 渲染（可叠加 OSD）→
+同一块表面直接送编码器。GL 渲染与编码共用同一块显存，全程不经过 CPU。注意 Y/UV 两个
+渲染目标尺寸不同（1080 与 540），需要分两趟绘制，不能直接做 MRT。
+
 零拷贝转码直接复用解码器的设备与帧池，编码器不再自己建池：
 
 ```c
@@ -176,6 +184,7 @@ config.hw_frames_ctx = frame->hw_frames_ctx;   /* 解码输出帧自带帧池 */
 | `src/vaapi_vpp.c` | VPP 缩放封装（scale_vaapi / VideoProc） |
 | `src/vaapi_dmabuf.c` | VAAPI 表面导出为 DRM PRIME（vaExportSurfaceHandle） |
 | `src/egl_interop.c` | dmabuf -> EGLImage -> GL 纹理（需要 EGL，编译期可选） |
+| `src/gl_vaapi.c` | GL 渲染结果直接写入编码器 VAAPI 表面并零拷贝编码 |
 | `src/vaapi_common.c` | 设备创建（DRM）、图像上传、错误码转换 |
 | `src/vaapi_info.c` | 驱动与显卡能力自检 |
 | `src/main.c` | 命令行入口与各子命令，含零拷贝转码实现 |
@@ -220,6 +229,9 @@ config.hw_frames_ctx = frame->hw_frames_ctx;   /* 解码输出帧自带帧池 */
 
 vaapi_demo 1.0.0，已验证 FFmpeg 7.1（含 libavfilter/scale_vaapi）/ libva 1.20 /
 Mesa 25.2（AMD RX 7900 XTX）/ Ubuntu 24.04（GNOME Wayland 会话）。
+
+`glencode` 已实测：GL 渲染（含移动 OSD 方块）→ 编码 1080p H.264/H.265 正常，
+解码回看画面方向、颜色与输入一致。
 
 零拷贝显示链路（vaExportSurfaceHandle -> EGLImage -> GL 纹理）已在 AMD RX 7900 XTX 上
 用 EGL surfaceless + FBO 读回验证，Y/UV 平面与 CPU 解码结果逐像素一致。

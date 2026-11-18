@@ -58,7 +58,7 @@ set(VAAPI_DEMO_SOURCES
 )
 
 if(EGL_FOUND)
-    list(APPEND VAAPI_DEMO_SOURCES src/egl_interop.c src/egl_headless.c)
+    list(APPEND VAAPI_DEMO_SOURCES src/egl_interop.c src/egl_headless.c src/gl_vaapi.c)
 endif()
 
 set_source_files_properties(third_party/glad/glad.c PROPERTIES COMPILE_OPTIONS "-w")

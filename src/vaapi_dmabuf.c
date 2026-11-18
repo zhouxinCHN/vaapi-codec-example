@@ -33,7 +33,7 @@ static void close_objects(VaapiDmabuf *dmabuf)
     dmabuf->exported = 0;
 }
 
-int vaapi_dmabuf_export(AVFrame *hw_frame, VaapiDmabuf *dmabuf)
+int vaapi_dmabuf_export_ex(AVFrame *hw_frame, VaapiDmabuf *dmabuf, int writable)
 {
     AVHWFramesContext *frames;
     AVHWDeviceContext *device;
@@ -70,7 +70,8 @@ int vaapi_dmabuf_export(AVFrame *hw_frame, VaapiDmabuf *dmabuf)
     memset(&va_desc, 0, sizeof(va_desc));
     status = vaExportSurfaceHandle(display, surface,
                                    VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
-                                   VA_EXPORT_SURFACE_READ_ONLY |
+                                   (writable ? VA_EXPORT_SURFACE_READ_WRITE
+                                             : VA_EXPORT_SURFACE_READ_ONLY) |
                                    VA_EXPORT_SURFACE_SEPARATE_LAYERS,
                                    &va_desc);
     if (status != VA_STATUS_SUCCESS) {
@@ -124,6 +125,11 @@ fail:
     }
     memset(dmabuf, 0, sizeof(*dmabuf));
     return ret;
+}
+
+int vaapi_dmabuf_export(AVFrame *hw_frame, VaapiDmabuf *dmabuf)
+{
+    return vaapi_dmabuf_export_ex(hw_frame, dmabuf, 0);
 }
 
 void vaapi_dmabuf_release(VaapiDmabuf *dmabuf)

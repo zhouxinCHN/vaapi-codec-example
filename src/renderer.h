@@ -15,7 +15,12 @@ typedef struct Renderer Renderer;
 
 int renderer_available(void);
 
-Renderer *renderer_create(int width, int height, const char *title);
+/* 实际使用的后端名（"wayland"/"x11"）与 GL 渲染器名，用于日志与能力判断。 */
+const char *renderer_backend_name(Renderer *renderer);
+const char *renderer_gl_renderer(Renderer *renderer);
+
+/* backend: "wayland" / "x11" / NULL("auto") */
+Renderer *renderer_create(int width, int height, const char *title, const char *backend);
 void renderer_destroy(Renderer *renderer);
 
 /* 上传一帧 NV12 数据（Y 平面 + UV 交错平面），宽高由 renderer_create 指定。 */

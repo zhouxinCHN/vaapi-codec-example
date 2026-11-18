@@ -22,11 +22,21 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <wayland-client.h>
-#include <wayland-egl.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <glad/glad.h>
+
+#ifdef HAVE_WAYLAND
+#include <wayland-client.h>
+#include <wayland-egl.h>
+#endif
+#ifdef HAVE_X11
+#include <X11/Xlib.h>
+#include <X11/Xatom.h>
+#include <X11/Xutil.h>
+#include <X11/keysym.h>
+#include <X11/XKBlib.h>
+#endif
 
 #include "egl_interop.h"
 #include "util.h"
@@ -35,6 +45,7 @@
 #define EGL_PLATFORM_WAYLAND_EXT 0x31D8
 #endif
 
+#ifdef HAVE_WAYLAND
 /* ------------------------------------------------------------------------- */
 /* xdg-shell 最小协议声明（仅用到 wm_base / surface / toplevel 的基本能力）    */
 /* ------------------------------------------------------------------------- */
@@ -148,11 +159,17 @@ enum {
     XDG_TOPLEVEL_SET_TITLE      = 2,
 };
 
+#endif /* HAVE_WAYLAND */
+
 /* ------------------------------------------------------------------------- */
 /* 渲染器                                                                     */
 /* ------------------------------------------------------------------------- */
 
 struct Renderer {
+    int backend;                 /* BACKEND_WAYLAND / BACKEND_X11 */
+    char gl_renderer[128];
+
+#ifdef HAVE_WAYLAND
     /* Wayland */
     struct wl_display *display;
     struct wl_registry *registry;
@@ -162,6 +179,18 @@ struct Renderer {
     struct xdg_surface *xdg_surface;
     struct xdg_toplevel *toplevel;
     struct wl_egl_window *egl_window;
+#endif
+
+#ifdef HAVE_X11
+    /* X11 */
+    Display *xdisplay;
+    Window xwindow;
+    Atom wm_delete;
+    int xscreen;
+    Colormap xcolormap;
+    Visual *xvisual;
+    int xdepth;
+#endif
 
     /* EGL */
     EGLDisplay egl_display;
@@ -224,6 +253,7 @@ static const char *kFragmentShader =
     "    FragColor = vec4(yuv, 1) * YUV_TO_RGB_MATRIX;\n"
     "}\n";
 
+#ifdef HAVE_WAYLAND
 /* ------------------------------------------------------------------------- */
 /* Wayland 事件                                                               */
 /* ------------------------------------------------------------------------- */
@@ -326,6 +356,8 @@ static const struct xdg_toplevel_listener toplevel_listener = {
     .wm_capabilities  = NULL,
 };
 
+#endif /* HAVE_WAYLAND */
+
 /* ------------------------------------------------------------------------- */
 /* GL 初始化                                                                  */
 /* ------------------------------------------------------------------------- */
@@ -420,7 +452,8 @@ static int renderer_init_gl(Renderer *r)
     return 0;
 }
 
-static int init_egl(Renderer *r)
+#ifdef HAVE_WAYLAND
+static int init_egl_wayland(Renderer *r)
 {
     PFNEGLGETPLATFORMDISPLAYEXTPROC get_platform_display;
     EGLint major = 0, minor = 0, count = 0;
@@ -478,22 +511,26 @@ static int init_egl(Renderer *r)
         return -1;
     }
 
-    LOG_INFO("GL: %s", glGetString(GL_RENDERER));
+    snprintf(r->gl_renderer, sizeof(r->gl_renderer), "%s",
+             glGetString(GL_RENDERER) ? (const char *)glGetString(GL_RENDERER) : "unknown");
     return 0;
 }
+#endif /* HAVE_WAYLAND */
 
 int renderer_available(void)
 {
     return 1;
 }
 
-Renderer *renderer_create(int width, int height, const char *title)
+#ifdef HAVE_WAYLAND
+static Renderer *create_wayland(int width, int height, const char *title)
 {
     Renderer *r;
 
     r = calloc(1, sizeof(*r));
     if (!r)
         return NULL;
+    r->backend = 1;
     r->width  = width;
     r->height = height;
     r->window_width  = width  > 1280 ? width / 2  : width;
@@ -534,8 +571,6 @@ Renderer *renderer_create(int width, int height, const char *title)
                           (void (**)(void))&xdg_surface_listener, r);
     wl_proxy_add_listener((struct wl_proxy *)r->toplevel,
                           (void (**)(void))&toplevel_listener, r);
-    wl_proxy_marshal_flags((struct wl_proxy *)r->toplevel, 1,
-                           NULL, 0, 0, NULL);
     /* Mutter 需要先收到 set_parent（可为空）才会接受后续的 configure/ack */
     wl_proxy_marshal_flags((struct wl_proxy *)r->toplevel, XDG_TOPLEVEL_SET_PARENT,
                            NULL, wl_proxy_get_version((struct wl_proxy *)r->toplevel), 0, NULL);
@@ -555,7 +590,7 @@ Renderer *renderer_create(int width, int height, const char *title)
     }
 
     /* 3. EGL + GL 初始化 */
-    if (init_egl(r) < 0) {
+    if (init_egl_wayland(r) < 0) {
         renderer_destroy(r);
         return NULL;
     }
@@ -574,6 +609,211 @@ Renderer *renderer_create(int width, int height, const char *title)
     r->egl = egl_interop_create();
 
     return r;
+}
+#endif /* HAVE_WAYLAND */
+
+#ifdef HAVE_X11
+static int init_egl_x11(Renderer *r)
+{
+    PFNEGLGETPLATFORMDISPLAYEXTPROC get_platform_display;
+    EGLint major = 0, minor = 0, count = 0;
+    EGLConfig configs[64];
+    EGLint config_attrs[] = {
+        EGL_SURFACE_TYPE,    EGL_WINDOW_BIT,
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
+        EGL_RED_SIZE,   8,
+        EGL_GREEN_SIZE, 8,
+        EGL_BLUE_SIZE,  8,
+        EGL_ALPHA_SIZE, 0,
+        EGL_NONE
+    };
+    get_platform_display = (PFNEGLGETPLATFORMDISPLAYEXTPROC)
+        eglGetProcAddress("eglGetPlatformDisplayEXT");
+    if (get_platform_display)
+        r->egl_display = get_platform_display(EGL_PLATFORM_X11_EXT, r->xdisplay, NULL);
+    if (!r->egl_display)
+        r->egl_display = eglGetDisplay((EGLNativeDisplayType)r->xdisplay);
+    if (r->egl_display == EGL_NO_DISPLAY) {
+        LOG_ERROR("EGL: 获取 X11 显示设备失败");
+        return -1;
+    }
+    if (!eglInitialize(r->egl_display, &major, &minor)) {
+        LOG_ERROR("EGL: 初始化失败");
+        return -1;
+    }
+    if (!eglBindAPI(EGL_OPENGL_API)) {
+        LOG_ERROR("EGL: 绑定 OpenGL 失败");
+        return -1;
+    }
+    if (!eglChooseConfig(r->egl_display, config_attrs, configs, 64, &count) || count == 0) {
+        LOG_ERROR("EGL: 找不到可用的 X11 配置");
+        return -1;
+    }
+    /* 逐个配置尝试拿到可用的 X visual（按 visualid 匹配，而不是 depth） */
+    for (int i = 0; i < count; i++) {
+        EGLint visual_id = 0;
+        XVisualInfo templ;
+        XVisualInfo *found;
+        int nfound = 0;
+
+        eglGetConfigAttrib(r->egl_display, configs[i], EGL_NATIVE_VISUAL_ID, &visual_id);
+        if (visual_id == 0)
+            continue;
+        memset(&templ, 0, sizeof(templ));
+        templ.visualid = (VisualID)visual_id;
+        found = XGetVisualInfo(r->xdisplay, VisualIDMask, &templ, &nfound);
+        if (!found || nfound == 0) {
+            if (found)
+                XFree(found);
+            continue;
+        }
+        r->egl_config = configs[i];
+        r->xvisual    = found[0].visual;
+        r->xdepth     = found[0].depth;
+        XFree(found);
+        return 0;
+    }
+    LOG_ERROR("X11: 找不到匹配的视觉类型");
+    return -1;
+}
+#endif /* HAVE_X11 */
+
+#ifdef HAVE_X11
+static Renderer *create_x11(int width, int height, const char *title)
+{
+    Renderer *r;
+    XSetWindowAttributes swa;
+    int screen;
+
+    r = calloc(1, sizeof(*r));
+    if (!r)
+        return NULL;
+    r->backend = 2;
+    r->width  = width;
+    r->height = height;
+    r->window_width  = width  > 1280 ? width / 2  : width;
+    r->window_height = height > 720  ? height / 2 : height;
+
+    r->xdisplay = XOpenDisplay(NULL);
+    if (!r->xdisplay) {
+        LOG_ERROR("无法打开 X 显示（DISPLAY 未设置？）");
+        free(r);
+        return NULL;
+    }
+    r->xscreen = screen = DefaultScreen(r->xdisplay);
+    XkbSetDetectableAutoRepeat(r->xdisplay, True, NULL);
+
+    if (init_egl_x11(r) < 0) {
+        renderer_destroy(r);
+        return NULL;
+    }
+    r->xcolormap = XCreateColormap(r->xdisplay, RootWindow(r->xdisplay, screen),
+                                   r->xvisual, AllocNone);
+    memset(&swa, 0, sizeof(swa));
+    swa.colormap   = r->xcolormap;
+    swa.event_mask = ExposureMask | StructureNotifyMask | KeyPressMask;
+    r->xwindow = XCreateWindow(r->xdisplay, RootWindow(r->xdisplay, screen),
+                               0, 0, r->window_width, r->window_height, 0,
+                               r->xdepth, InputOutput, r->xvisual,
+                               CWColormap | CWEventMask, &swa);
+    if (!r->xwindow) {
+        LOG_ERROR("X11: 创建窗口失败");
+        renderer_destroy(r);
+        return NULL;
+    }
+    XStoreName(r->xdisplay, r->xwindow, title ? title : "VAAPI Player");
+    r->wm_delete = XInternAtom(r->xdisplay, "WM_DELETE_WINDOW", False);
+    XSetWMProtocols(r->xdisplay, r->xwindow, &r->wm_delete, 1);
+    XMapWindow(r->xdisplay, r->xwindow);
+    XFlush(r->xdisplay);
+
+    r->egl_surface = eglCreateWindowSurface(r->egl_display, r->egl_config,
+                                            (EGLNativeWindowType)r->xwindow, NULL);
+    if (r->egl_surface == EGL_NO_SURFACE) {
+        LOG_ERROR("EGL: 创建 X11 窗口表面失败");
+        renderer_destroy(r);
+        return NULL;
+    }
+    r->egl_context = eglCreateContext(r->egl_display, r->egl_config, EGL_NO_CONTEXT, NULL);
+    if (r->egl_context == EGL_NO_CONTEXT ||
+        !eglMakeCurrent(r->egl_display, r->egl_surface, r->egl_surface, r->egl_context)) {
+        LOG_ERROR("EGL: 创建/激活上下文失败");
+        renderer_destroy(r);
+        return NULL;
+    }
+    if (!gladLoadGLLoader((GLADloadproc)eglGetProcAddress)) {
+        LOG_ERROR("加载 OpenGL 函数失败");
+        renderer_destroy(r);
+        return NULL;
+    }
+
+    snprintf(r->gl_renderer, sizeof(r->gl_renderer), "%s",
+             glGetString(GL_RENDERER) ? (const char *)glGetString(GL_RENDERER) : "unknown");
+    glViewport(0, 0, r->window_width, r->window_height);
+    if (renderer_init_gl(r) < 0) {
+        renderer_destroy(r);
+        return NULL;
+    }
+    r->egl = egl_interop_create();
+    return r;
+}
+#endif /* HAVE_X11 */
+
+Renderer *renderer_create(int width, int height, const char *title, const char *backend)
+{
+    int want_wayland = 0;
+    int want_x11 = 0;
+
+    if (!backend || !strcmp(backend, "auto")) {
+        const char *wayland_display = getenv("WAYLAND_DISPLAY");
+
+        if (wayland_display && *wayland_display) {
+            want_wayland = 1;
+            want_x11 = 1;      /* Wayland 失败时退回 X11 */
+        } else {
+            want_x11 = 1;
+            want_wayland = 1;
+        }
+    } else if (!strcmp(backend, "wayland")) {
+        want_wayland = 1;
+    } else if (!strcmp(backend, "x11")) {
+        want_x11 = 1;
+    } else {
+        LOG_ERROR("未知窗口后端: %s（可选 wayland / x11 / auto）", backend);
+        return NULL;
+    }
+
+#ifdef HAVE_WAYLAND
+    if (want_wayland) {
+        Renderer *r = create_wayland(width, height, title);
+        if (r)
+            return r;
+        LOG_WARN("Wayland 后端不可用");
+    }
+#endif
+#ifdef HAVE_X11
+    if (want_x11) {
+        Renderer *r = create_x11(width, height, title);
+        if (r)
+            return r;
+        LOG_WARN("X11 后端不可用");
+    }
+#endif
+    (void)want_wayland;
+    (void)want_x11;
+    return NULL;
+}
+
+const char *renderer_backend_name(Renderer *r)
+{
+    if (!r)
+        return "";
+    return r->backend == 1 ? "wayland" : "x11";
+}
+
+const char *renderer_gl_renderer(Renderer *r)
+{
+    return r ? r->gl_renderer : "";
 }
 
 void renderer_destroy(Renderer *r)
@@ -603,6 +843,7 @@ void renderer_destroy(Renderer *r)
             eglDestroyContext(r->egl_display, r->egl_context);
         eglTerminate(r->egl_display);
     }
+#ifdef HAVE_WAYLAND
     if (r->egl_window)
         wl_egl_window_destroy(r->egl_window);
     if (r->toplevel)
@@ -617,6 +858,15 @@ void renderer_destroy(Renderer *r)
         wl_registry_destroy(r->registry);
     if (r->display)
         wl_display_disconnect(r->display);
+#endif
+#ifdef HAVE_X11
+    if (r->xwindow && r->xdisplay)
+        XDestroyWindow(r->xdisplay, r->xwindow);
+    if (r->xcolormap && r->xdisplay)
+        XFreeColormap(r->xdisplay, r->xcolormap);
+    if (r->xdisplay)
+        XCloseDisplay(r->xdisplay);
+#endif
 
     free(r);
 }
@@ -718,24 +968,65 @@ int renderer_should_close(Renderer *r)
 
 void renderer_swap_buffers(Renderer *r)
 {
-    if (r && r->egl_surface != EGL_NO_SURFACE)
-        eglSwapBuffers(r->egl_display, r->egl_surface);
+    if (!r || r->egl_surface == EGL_NO_SURFACE)
+        return;
 
+    eglSwapBuffers(r->egl_display, r->egl_surface);
+
+#ifdef HAVE_WAYLAND
     /* 第一帧交换后请求 frame 回调，用于确认合成器确实在呈现 */
-    if (r && !r->frame_presented) {
+    if (r->backend == 1 && !r->frame_presented) {
         struct wl_callback *cb = wl_surface_frame(r->surface);
         if (cb)
             wl_callback_add_listener(cb, &frame_listener, r);
     }
+#endif
 }
 
 void renderer_poll_events(Renderer *r)
 {
-    if (!r || !r->display)
+    if (!r)
         return;
 
-    wl_display_flush(r->display);
-    wl_display_dispatch_pending(r->display);
+#ifdef HAVE_WAYLAND
+    if (r->backend == 1) {
+        if (!r->display)
+            return;
+        wl_display_flush(r->display);
+        wl_display_dispatch_pending(r->display);
+        return;
+    }
+#endif
+#ifdef HAVE_X11
+    if (r->backend == 2 && r->xdisplay) {
+        while (XPending(r->xdisplay) > 0) {
+            XEvent event;
+
+            XNextEvent(r->xdisplay, &event);
+            switch (event.type) {
+            case ClientMessage:
+                if ((Atom)event.xclient.data.l[0] == r->wm_delete)
+                    r->should_close = 1;
+                break;
+            case KeyPress:
+                if (XLookupKeysym(&event.xkey, 0) == XK_Escape)
+                    r->should_close = 1;
+                break;
+            case ConfigureNotify:
+                if (event.xconfigure.width > 0 && event.xconfigure.height > 0 &&
+                    (event.xconfigure.width != r->window_width ||
+                     event.xconfigure.height != r->window_height)) {
+                    r->window_width  = event.xconfigure.width;
+                    r->window_height = event.xconfigure.height;
+                    glViewport(0, 0, r->window_width, r->window_height);
+                }
+                break;
+            default:
+                break;
+            }
+        }
+    }
+#endif
 }
 
 double renderer_time(void)
@@ -754,11 +1045,12 @@ int renderer_available(void)
     return 0;
 }
 
-Renderer *renderer_create(int width, int height, const char *title)
+Renderer *renderer_create(int width, int height, const char *title, const char *backend)
 {
     (void)width;
     (void)height;
     (void)title;
+    (void)backend;
     LOG_WARN("本版本编译时未找到 wayland-client/wayland-egl/EGL，无法显示视频窗口");
     LOG_WARN("如需播放功能请先安装: sudo apt install libwayland-dev libegl-dev 然后重新 make");
     return NULL;
@@ -777,6 +1069,18 @@ int renderer_draw_nv12(Renderer *renderer, const uint8_t *data,
     (void)linesize_y;
     (void)linesize_uv;
     return -1;
+}
+
+const char *renderer_backend_name(Renderer *renderer)
+{
+    (void)renderer;
+    return "";
+}
+
+const char *renderer_gl_renderer(Renderer *renderer)
+{
+    (void)renderer;
+    return "";
 }
 
 int renderer_supports_dmabuf(Renderer *renderer)

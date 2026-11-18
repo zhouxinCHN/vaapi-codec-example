@@ -750,6 +750,7 @@ static void play_usage(void)
         "  -i, --input <文件>        输入视频（默认 samples/%s）\n"
         "  -S, --scale <宽x高>       解码后用 VPP 缩放显示，例如 1280x720\n"
         "      --zero-copy           零拷贝显示：dmabuf -> EGLImage -> GL 纹理\n"
+        "      --backend <wayland|x11|auto>  窗口后端，默认按环境自动选择\n"
         "                            （需要编译时找到 EGL，运行时使用 EGL 上下文）\n"
         "      --loop                循环播放\n"
         "  -d, --device <节点>       DRM 设备\n"
@@ -772,11 +773,13 @@ static int command_play(int argc, char **argv)
     int scale_height = 0;
     int zero_copy = 0;
     int loop = 0;
+    const char *backend = NULL;
     int c;
     static const struct option options[] = {
         { "input",           required_argument, NULL, 'i' },
         { "scale",           required_argument, NULL, 'S' },
         { "zero-copy",       no_argument,       NULL, 1002 },
+        { "backend",         required_argument, NULL, 1004 },
         { "loop",            no_argument,       NULL, 1000 },
         { "device",          required_argument, NULL, 'd' },
         { "connection-type", required_argument, NULL, 1001 },
@@ -796,6 +799,7 @@ static int command_play(int argc, char **argv)
             break;
         case 1000: loop = 1; break;
         case 1002: zero_copy = 1; break;
+        case 1004: backend = optarg; break;
         case 'd': device = optarg; break;
         case 1001: connection_type = optarg; break;
         case 'h':
@@ -831,14 +835,20 @@ static int command_play(int argc, char **argv)
         return 1;
 
     renderer = renderer_create(vaapi_decoder_width(decoder), vaapi_decoder_height(decoder),
-                               "VAAPI 硬件解码播放器");
+                               "VAAPI 硬件解码播放器", backend);
     if (!renderer) {
         vaapi_decoder_close(decoder);
         return 1;
     }
 
-    /* 请求了零拷贝但当前环境不支持（无 EGL 上下文等）：退回 CPU 上传路径重新打开解码器 */
-    if (zero_copy && !renderer_supports_dmabuf(renderer)) {
+    LOG_INFO("窗口后端: %s, GL: %s", renderer_backend_name(renderer),
+             renderer_gl_renderer(renderer));
+
+    /* 请求了零拷贝但当前环境不支持（无 EGL 上下文 / 软件渲染等）：退回 CPU 上传路径 */
+    if (zero_copy && (!renderer_supports_dmabuf(renderer) ||
+                      strstr(renderer_gl_renderer(renderer), "llvmpipe") ||
+                      strstr(renderer_gl_renderer(renderer), "softpipe") ||
+                      strstr(renderer_gl_renderer(renderer), "SwiftShader"))) {
         LOG_WARN("当前环境不支持 dmabuf 零拷贝显示，回退到 CPU 上传路径");
 #ifdef HAVE_EGL
         LOG_WARN("提示: GL 渲染器为 %s，零拷贝显示要求 GL 上下文与 VAAPI 使用同一块显卡",
@@ -853,7 +863,7 @@ static int command_play(int argc, char **argv)
         if (vaapi_decoder_open(&decoder, input, &config) < 0)
             return 1;
         renderer = renderer_create(vaapi_decoder_width(decoder), vaapi_decoder_height(decoder),
-                                   "VAAPI 硬件解码播放器");
+                                   "VAAPI 硬件解码播放器", backend);
         if (!renderer) {
             vaapi_decoder_close(decoder);
             return 1;

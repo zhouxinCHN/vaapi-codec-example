@@ -38,6 +38,9 @@ pkg_check_modules(EGL QUIET IMPORTED_TARGET egl)
 # Wayland：原生窗口显示（不使用 GLFW，避免 XWayland 落到软件渲染）
 pkg_check_modules(WAYLAND QUIET IMPORTED_TARGET wayland-client wayland-egl)
 
+# X11：供纯 X 环境使用（可用 XWayland 验证）
+pkg_check_modules(X11 QUIET IMPORTED_TARGET x11)
+
 # ---------------------------------------------------------------------------
 # 目标
 # ---------------------------------------------------------------------------
@@ -92,12 +95,22 @@ else()
 endif()
 
 if(EGL_FOUND AND WAYLAND_FOUND)
-    target_compile_definitions(vaapi_demo PRIVATE HAVE_DISPLAY=1)
+    target_compile_definitions(vaapi_demo PRIVATE HAVE_WAYLAND=1)
     target_link_libraries(vaapi_demo PRIVATE PkgConfig::WAYLAND)
-    message(STATUS "找到 wayland-client/wayland-egl: 已启用 play 播放功能 (原生 Wayland 窗口)")
+    message(STATUS "找到 wayland-client/wayland-egl: 启用 Wayland 窗口后端")
+endif()
+
+if(EGL_FOUND AND X11_FOUND)
+    target_compile_definitions(vaapi_demo PRIVATE HAVE_X11=1)
+    target_link_libraries(vaapi_demo PRIVATE PkgConfig::X11)
+    message(STATUS "找到 X11: 启用 X11 窗口后端")
+endif()
+
+if(EGL_FOUND AND (WAYLAND_FOUND OR X11_FOUND))
+    target_compile_definitions(vaapi_demo PRIVATE HAVE_DISPLAY=1)
 else()
-    message(STATUS "未找到 Wayland 开发库: 不编译窗口播放 "
-                   "(需要时安装 libwayland-dev libegl-dev 后重新编译)")
+    message(STATUS "缺少 Wayland/X11 开发库: 不编译窗口播放 "
+                   "(需要时安装 libwayland-dev 或 libx11-dev + libegl-dev 后重新编译)")
 endif()
 
 # ---------------------------------------------------------------------------

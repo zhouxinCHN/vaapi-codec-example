@@ -12,7 +12,8 @@
 | `encode` | 硬件编码：YUV（I420/NV12）→ H.264 / H.265，支持 CQP 与 VBR 两种码控 |
 | `decode` | 硬件解码：MP4 / H.264 / H.265 → YUV（NV12 或 I420），可存首帧截图 |
 | VPP 缩放 | 编码前 / 解码后 / 转码中调用 VAAPI VideoProc 在显存内缩放（`-S 1280x720`） |
-| `play` | 解码后 OpenGL 实时播放（编译期检测到 glfw3 才启用） |
+| 零拷贝显示 | 解码帧导出 dmabuf → EGLImage → GL 纹理，画面不经过 CPU（`play --zero-copy`） |
+| `play` | 解码后实时播放（EGL + Wayland 原生窗口，可用 `--zero-copy` 走 dmabuf） |
 | `transcode` | 解码 → 编码，默认零拷贝：帧数据全程留在显存 |
 | `selftest` | 一键自检：编码 → 解码 → PSNR 比对，判定整条硬件链路是否正常 |
 
@@ -26,14 +27,15 @@ VPP 走 FFmpeg 的 `scale_vaapi` 过滤器（VAAPI VideoProc 通道），输入�
 
 - 支持 VAAPI 的 AMD / Intel 显卡，`vainfo` 能正常列出 profile；
 - FFmpeg 开发库（编译时需 `--enable-vaapi`）、libva、CMake ≥ 3.16、GCC；
-- glfw3 可选，仅 `play` 播放窗口需要。
+- Wayland 开发库（wayland-client / wayland-egl）+ EGL，仅 `play` 窗口与零拷贝显示需要；
+  不使用 GLFW（GLFW 3.3 不支持 Wayland，只能走 XWayland 软件渲染）。
 
 ```shell
 # Ubuntu / Kylin
 sudo apt install build-essential cmake pkg-config vainfo \
                  libva-dev libva-drm2 libdrm-dev \
                  libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev libswscale-dev
-sudo apt install libglfw3-dev        # 可选：播放功能
+sudo apt install libwayland-dev libegl-dev  # 可选：播放 / 零拷贝显示
 
 vainfo                               # 先确认驱动可用
 ```
@@ -75,10 +77,13 @@ vaapi_demo decode --snapshot first.ppm              # 解码并保存首帧，�
 vaapi_demo decode -p nv12 --max-frames 60           # 只解前 60 帧
 vaapi_demo decode -S 640x360 --snapshot small.ppm   # 解码后 VPP 缩放到 360p
 vaapi_demo play -i samples/video1080.mp4
+vaapi_demo play --zero-copy                         # 解码帧零拷贝进 GL（dmabuf -> EGLImage）
 vaapi_demo transcode -c hevc -o output/out.h265     # 零拷贝转码
 vaapi_demo transcode -S 1280x720                    # 转码同时缩放到 720p
 vaapi_demo transcode --no-zero-copy                 # CPU 中转，用于性能对比
 vaapi_demo selftest
+vaapi_demo dmabuf                                   # 导出 DRM PRIME 并打印描述符（无需显示环境）
+vaapi_demo dmabuf --gl                              # 无头环境下导入并读回比对（验证零拷贝链路）
 ```
 
 常用选项：
@@ -91,6 +96,7 @@ vaapi_demo selftest
 | `-b <kbps>` / `--qp <n>` | 码率控制（VBR）/ 恒定质量，默认 CQP 26 |
 | `-g <帧数>`、`--bframes <n>` | GOP、连续 B 帧（默认等于帧率、3） |
 | `-S, --scale <宽x高>` | VPP 缩放目标尺寸，如 `1280x720`（默认不缩放，宽高需为偶数） |
+| `--zero-copy` | `play` 专用：走 dmabuf 零拷贝显示，不支持时自动回退 CPU 上传 |
 | `--max-frames <n>` | 只处理前 n 帧 |
 | `-d <节点>`、`--connection-type drm\|x11` | 多显卡指定设备；默认 drm，适合无界面服务器 |
 
@@ -127,6 +133,28 @@ AVFrame *scaled = NULL;
 vaapi_vpp_process(vpp, hw_frame_1080p, &scaled);   /* 输出 1280x720 硬件帧 */
 ```
 
+窗口与显示完全走 EGL + Wayland（`wayland-client` + `wayland-egl`），没有 GLFW 依赖：
+GLFW 3.3 不支持 Wayland，只能退回 XWayland，某些桌面环境下会落到 llvmpipe 软件渲染，
+导致 dmabuf 无法与 VAAPI 同设备导入。
+
+零拷贝显示是"导出 + 导入"两段接口：
+
+```c
+/* 1. 导出：VAAPI 表面 -> dmabuf 描述符（fd/offset/pitch/modifier） */
+vaExportSurfaceHandle(display, surface,
+                      VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+                      VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_SEPARATE_LAYERS,
+                      &desc);
+
+/* 2. 导入：dmabuf -> EGLImage -> GL 纹理，着色器直接采样 */
+EGLImageKHR image = eglCreateImageKHR(dpy, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, attrs);
+glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, image);
+```
+
+注意两点：AMD/Intel 导出的表面常带 tiled modifier，EGL 导入时必须把
+`EGL_DMA_BUF_PLANE0_MODIFIER_LO/HI_EXT` 一并传入；表面高度会按 16 像素对齐
+（1080 -> 1088），渲染时按可见尺寸裁剪。
+
 零拷贝转码直接复用解码器的设备与帧池，编码器不再自己建池：
 
 ```c
@@ -141,6 +169,8 @@ config.hw_frames_ctx = frame->hw_frames_ctx;   /* 解码输出帧自带帧池 */
 | `src/vaapi_encoder.c` | 硬件编码封装，可独立复用 |
 | `src/vaapi_decoder.c` | 硬件解码封装，可独立复用 |
 | `src/vaapi_vpp.c` | VPP 缩放封装（scale_vaapi / VideoProc） |
+| `src/vaapi_dmabuf.c` | VAAPI 表面导出为 DRM PRIME（vaExportSurfaceHandle） |
+| `src/egl_interop.c` | dmabuf -> EGLImage -> GL 纹理（需要 EGL，编译期可选） |
 | `src/vaapi_common.c` | 设备创建（DRM）、图像上传、错误码转换 |
 | `src/vaapi_info.c` | 驱动与显卡能力自检 |
 | `src/main.c` | 命令行入口与各子命令，含零拷贝转码实现 |
@@ -156,8 +186,16 @@ config.hw_frames_ctx = frame->hw_frames_ctx;   /* 解码输出帧自带帧池 */
 **提示未提供 h264_vaapi**：系统 FFmpeg 编译时未启用 VAAPI，用
 `ffmpeg -hide_banner -encoders | grep vaapi` 确认。
 
-**没有播放功能**：安装 `libglfw3-dev` 后 `make clean && make`；无图形界面时用
+**没有播放功能**：安装 `libwayland-dev libegl-dev` 后 `make clean && make`；无图形界面时用
 `decode --snapshot` 保存图片查看画面。
+
+**播放时日志出现 `invalid method 8, object xdg_surface`**：这是 Mutter 的已知行为，
+创建窗口后已先调用 `xdg_toplevel.set_parent`，窗口仍会正常呈现，不影响播放；如遇到
+画面不显示，可用 `dmabuf --gl` 无头验证导入链路。
+
+**`play --zero-copy` 提示回退 CPU 上传**：说明当前 GL 上下文不是 EGL 创建，或驱动缺少
+`EGL_EXT_image_dma_buf_import`。安装 `libegl-dev` 重新编译，并确认在图形会话下运行；
+没有显示环境时可用 `dmabuf` 命令单独验证导出接口是否正常。
 
 **H.265 输出为 1920×1088**：按 16 像素对齐的正常现象，与 FFmpeg 官方 `hevc_vaapi` 一致。
 
@@ -176,4 +214,7 @@ config.hw_frames_ctx = frame->hw_frames_ctx;   /* 解码输出帧自带帧池 */
 ## 版本
 
 vaapi_demo 1.0.0，已验证 FFmpeg 7.1（含 libavfilter/scale_vaapi）/ libva 1.20 /
-Mesa 25.2（AMD RX 7900 XTX）/ Ubuntu 24.04。
+Mesa 25.2（AMD RX 7900 XTX）/ Ubuntu 24.04（GNOME Wayland 会话）。
+
+零拷贝显示链路（vaExportSurfaceHandle -> EGLImage -> GL 纹理）已在 AMD RX 7900 XTX 上
+用 EGL surfaceless + FBO 读回验证，Y/UV 平面与 CPU 解码结果逐像素一致。

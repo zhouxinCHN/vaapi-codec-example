@@ -30,9 +30,13 @@ pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
 )
 
 pkg_check_modules(VA REQUIRED IMPORTED_TARGET libva)
+pkg_check_modules(DRM REQUIRED IMPORTED_TARGET libdrm)
 
-# glfw3 只用于 play 播放窗口，没有也不影响编解码功能
-pkg_check_modules(GLFW QUIET IMPORTED_TARGET glfw3)
+# EGL：dmabuf -> EGLImage -> GL 纹理，以及 surfaceless 导入自检
+pkg_check_modules(EGL QUIET IMPORTED_TARGET egl)
+
+# Wayland：原生窗口显示（不使用 GLFW，避免 XWayland 落到软件渲染）
+pkg_check_modules(WAYLAND QUIET IMPORTED_TARGET wayland-client wayland-egl)
 
 # ---------------------------------------------------------------------------
 # 目标
@@ -44,14 +48,17 @@ set(VAAPI_DEMO_SOURCES
     src/vaapi_encoder.c
     src/vaapi_decoder.c
     src/vaapi_info.c
+    src/vaapi_dmabuf.c
     src/vaapi_vpp.c
     src/renderer.c
+    third_party/glad/glad.c
 )
 
-if(GLFW_FOUND)
-    list(APPEND VAAPI_DEMO_SOURCES third_party/glad/glad.c)
-    set_source_files_properties(third_party/glad/glad.c PROPERTIES COMPILE_OPTIONS "-w")
+if(EGL_FOUND)
+    list(APPEND VAAPI_DEMO_SOURCES src/egl_interop.c src/egl_headless.c)
 endif()
+
+set_source_files_properties(third_party/glad/glad.c PROPERTIES COMPILE_OPTIONS "-w")
 
 add_executable(vaapi_demo ${VAAPI_DEMO_SOURCES})
 
@@ -70,17 +77,27 @@ target_compile_definitions(vaapi_demo PRIVATE
 target_link_libraries(vaapi_demo PRIVATE
     PkgConfig::FFMPEG
     PkgConfig::VA
+    PkgConfig::DRM
     m
     pthread
     ${CMAKE_DL_LIBS}
 )
 
-if(GLFW_FOUND)
-    target_compile_definitions(vaapi_demo PRIVATE HAVE_GLFW=1)
-    target_link_libraries(vaapi_demo PRIVATE PkgConfig::GLFW)
-    message(STATUS "找到 glfw3: 已启用 play 播放功能")
+if(EGL_FOUND)
+    target_compile_definitions(vaapi_demo PRIVATE HAVE_EGL=1)
+    target_link_libraries(vaapi_demo PRIVATE PkgConfig::EGL)
+    message(STATUS "找到 EGL: 已启用 dmabuf 导入与 surfaceless 自检")
 else()
-    message(STATUS "未找到 glfw3: 不编译播放功能 (需要时执行 sudo apt install libglfw3-dev 后重新编译)")
+    message(STATUS "未找到 EGL: 不编译 dmabuf 导入 (需要时安装 libegl-dev 后重新编译)")
+endif()
+
+if(EGL_FOUND AND WAYLAND_FOUND)
+    target_compile_definitions(vaapi_demo PRIVATE HAVE_DISPLAY=1)
+    target_link_libraries(vaapi_demo PRIVATE PkgConfig::WAYLAND)
+    message(STATUS "找到 wayland-client/wayland-egl: 已启用 play 播放功能 (原生 Wayland 窗口)")
+else()
+    message(STATUS "未找到 Wayland 开发库: 不编译窗口播放 "
+                   "(需要时安装 libwayland-dev libegl-dev 后重新编译)")
 endif()
 
 # ---------------------------------------------------------------------------

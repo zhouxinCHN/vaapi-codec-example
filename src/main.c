@@ -5,7 +5,7 @@
  *   info       环境自检
  *   encode     硬件编码  YUV  -> H.264 / H.265
  *   decode     硬件解码  MP4  -> YUV
- *   play       硬件解码 + 实时播放（需要 glfw3）
+ *   play       硬件解码 + 实时播放（EGL + Wayland 窗口）
  *   transcode  解码 + 编码，默认零拷贝（帧数据全程留在显存）
  *   selftest   一键全流程校验（编码->解码->PSNR）
  */
@@ -27,6 +27,15 @@
 #include "renderer.h"
 #include "util.h"
 #include "vaapi_common.h"
+#ifdef HAVE_EGL
+#include <glad/glad.h>
+#endif
+#ifdef HAVE_EGL
+#include "egl_headless.h"
+#include "egl_interop.h"
+#endif
+
+#include "vaapi_dmabuf.h"
 #include "vaapi_decoder.h"
 #include "vaapi_encoder.h"
 #include "vaapi_info.h"
@@ -693,6 +702,7 @@ typedef struct {
     int frames;
     int width;
     int height;
+    int zero_copy;
 } PlayState;
 
 static int play_frame_handler(void *opaque, AVFrame *frame)
@@ -700,14 +710,29 @@ static int play_frame_handler(void *opaque, AVFrame *frame)
     PlayState *state = opaque;
     double target;
 
+    /* 先处理 Wayland 事件：ack_configure 必须在第一次 swap 之前发出，
+     * 否则合成器不呈现，eglSwapBuffers 会因缓冲区无人回收而阻塞。 */
+    renderer_poll_events(state->renderer);
     if (renderer_should_close(state->renderer))
         return AVERROR_EXIT;
 
-    if (renderer_draw_nv12(state->renderer, frame->data[0],
-                           frame->linesize[0], frame->linesize[1]) < 0)
+    if (state->zero_copy) {
+        VaapiDmabuf dmabuf;
+        int ret;
+
+        if (vaapi_dmabuf_export(frame, &dmabuf) < 0)
+            return AVERROR_EXTERNAL;
+        ret = renderer_draw_dmabuf(state->renderer, &dmabuf.desc,
+                                   dmabuf.width, dmabuf.height,
+                                   frame->width, frame->height);
+        vaapi_dmabuf_release(&dmabuf);
+        if (ret < 0)
+            return AVERROR_EXTERNAL;
+    } else if (renderer_draw_nv12(state->renderer, frame->data[0],
+                                  frame->linesize[0], frame->linesize[1]) < 0) {
         return AVERROR_EXTERNAL;
+    }
     renderer_swap_buffers(state->renderer);
-    renderer_poll_events(state->renderer);
 
     state->frames++;
     target = state->start_time + state->frames / (state->fps > 0 ? state->fps : 25.0);
@@ -724,6 +749,8 @@ static void play_usage(void)
         "\n"
         "  -i, --input <文件>        输入视频（默认 samples/%s）\n"
         "  -S, --scale <宽x高>       解码后用 VPP 缩放显示，例如 1280x720\n"
+        "      --zero-copy           零拷贝显示：dmabuf -> EGLImage -> GL 纹理\n"
+        "                            （需要编译时找到 EGL，运行时使用 EGL 上下文）\n"
         "      --loop                循环播放\n"
         "  -d, --device <节点>       DRM 设备\n"
         "      --connection-type <t> drm(默认) / x11\n"
@@ -743,11 +770,13 @@ static int command_play(int argc, char **argv)
     char sample_path[4096];
     int scale_width = 0;
     int scale_height = 0;
+    int zero_copy = 0;
     int loop = 0;
     int c;
     static const struct option options[] = {
         { "input",           required_argument, NULL, 'i' },
         { "scale",           required_argument, NULL, 'S' },
+        { "zero-copy",       no_argument,       NULL, 1002 },
         { "loop",            no_argument,       NULL, 1000 },
         { "device",          required_argument, NULL, 'd' },
         { "connection-type", required_argument, NULL, 1001 },
@@ -766,6 +795,7 @@ static int command_play(int argc, char **argv)
             }
             break;
         case 1000: loop = 1; break;
+        case 1002: zero_copy = 1; break;
         case 'd': device = optarg; break;
         case 1001: connection_type = optarg; break;
         case 'h':
@@ -776,8 +806,8 @@ static int command_play(int argc, char **argv)
     }
 
     if (!renderer_available()) {
-        LOG_ERROR("当前程序编译时没有启用播放功能（缺少 glfw3）");
-        LOG_ERROR("安装依赖后重新编译即可: sudo apt install libglfw3-dev && make clean && make");
+        LOG_ERROR("当前程序编译时没有启用播放功能（缺少 wayland-client/wayland-egl/EGL）");
+        LOG_ERROR("安装依赖后重新编译即可: sudo apt install libwayland-dev libegl-dev && make clean && make");
         return 1;
     }
 
@@ -792,8 +822,8 @@ static int command_play(int argc, char **argv)
     memset(&config, 0, sizeof(config));
     config.device          = device;
     config.connection_type = connection_type;
-    config.want_hw_frames  = 0;
-    config.out_format      = AV_PIX_FMT_NV12;   /* 显示模块按 NV12 上传纹理 */
+    config.want_hw_frames  = zero_copy ? 1 : 0;   /* 零拷贝需要硬件帧 */
+    config.out_format      = zero_copy ? AV_PIX_FMT_NONE : AV_PIX_FMT_NV12;
     config.scale_width     = scale_width;
     config.scale_height    = scale_height;
 
@@ -807,13 +837,40 @@ static int command_play(int argc, char **argv)
         return 1;
     }
 
+    /* 请求了零拷贝但当前环境不支持（无 EGL 上下文等）：退回 CPU 上传路径重新打开解码器 */
+    if (zero_copy && !renderer_supports_dmabuf(renderer)) {
+        LOG_WARN("当前环境不支持 dmabuf 零拷贝显示，回退到 CPU 上传路径");
+#ifdef HAVE_EGL
+        LOG_WARN("提示: GL 渲染器为 %s，零拷贝显示要求 GL 上下文与 VAAPI 使用同一块显卡",
+                 glGetString(GL_RENDERER) ? (const char *)glGetString(GL_RENDERER) : "未知");
+#endif
+        zero_copy = 0;
+        renderer_destroy(renderer);
+        vaapi_decoder_close(decoder);
+
+        config.want_hw_frames = 0;
+        config.out_format     = AV_PIX_FMT_NV12;
+        if (vaapi_decoder_open(&decoder, input, &config) < 0)
+            return 1;
+        renderer = renderer_create(vaapi_decoder_width(decoder), vaapi_decoder_height(decoder),
+                                   "VAAPI 硬件解码播放器");
+        if (!renderer) {
+            vaapi_decoder_close(decoder);
+            return 1;
+        }
+    }
+
     memset(&state, 0, sizeof(state));
     state.renderer   = renderer;
     state.fps        = vaapi_decoder_fps(decoder);
     state.width      = vaapi_decoder_width(decoder);
     state.height     = vaapi_decoder_height(decoder);
+    state.zero_copy  = zero_copy;
     state.start_time = renderer_time();
 
+    LOG_INFO("显示方式: %s", zero_copy
+             ? "零拷贝（dmabuf -> EGLImage -> GL 纹理）"
+             : "CPU 上传（VAAPI -> 内存 -> glTexImage2D）");
     LOG_INFO("播放中: %s (%dx%d, %.2f fps)，关闭窗口或按 ESC 退出",
              input, state.width, state.height, state.fps);
 
@@ -826,6 +883,310 @@ static int command_play(int argc, char **argv)
 
     renderer_destroy(renderer);
     vaapi_decoder_close(decoder);
+    return 0;
+}
+
+/* ------------------------------------------------------------------------- */
+/* dmabuf 导出验证（不需要显示环境）                                          */
+/* ------------------------------------------------------------------------- */
+
+typedef struct {
+    int frames;
+    int failed;
+    int printed;
+} DmabufCheck;
+
+static int dmabuf_check_handler(void *opaque, AVFrame *frame)
+{
+    DmabufCheck *check = opaque;
+    VaapiDmabuf dmabuf;
+
+    if (vaapi_dmabuf_export(frame, &dmabuf) < 0) {
+        check->failed++;
+        return AVERROR_EXTERNAL;
+    }
+    if (!check->printed) {
+        vaapi_dmabuf_print(&dmabuf);
+        check->printed = 1;
+    }
+    if (!vaapi_dmabuf_is_nv12_like(&dmabuf)) {
+        LOG_WARN("导出结果不是 Y/UV 双平面，无法直接按 NV12 导入 GL");
+        check->failed++;
+    }
+    vaapi_dmabuf_release(&dmabuf);
+    check->frames++;
+    return 0;
+}
+
+static int run_dmabuf_check(const char *input, const char *device,
+                            const char *connection_type,
+                            int scale_width, int scale_height,
+                            int max_frames, DmabufCheck *check)
+{
+    VaapiDecoderConfig config;
+    VaapiDecoder *decoder = NULL;
+    int ret;
+
+    memset(check, 0, sizeof(*check));
+    memset(&config, 0, sizeof(config));
+    config.device          = device;
+    config.connection_type = connection_type;
+    config.want_hw_frames  = 1;          /* 拿到硬件帧才能导出 dmabuf */
+    config.out_format      = AV_PIX_FMT_NONE;
+    config.max_frames      = max_frames;
+    config.scale_width     = scale_width;
+    config.scale_height    = scale_height;
+
+    if (vaapi_decoder_open(&decoder, input, &config) < 0)
+        return -1;
+
+    ret = vaapi_decoder_decode(decoder, dmabuf_check_handler, check);
+    vaapi_decoder_close(decoder);
+
+    if (ret < 0 || check->frames <= 0 || check->failed > 0)
+        return -1;
+    return 0;
+}
+
+#ifdef HAVE_EGL
+typedef struct {
+    AVFrame *frame;
+} FrameCapture;
+
+static int capture_frame_handler(void *opaque, AVFrame *frame)
+{
+    FrameCapture *capture = opaque;
+
+    if (!capture->frame)
+        capture->frame = av_frame_alloc();
+    av_frame_unref(capture->frame);
+    av_frame_ref(capture->frame, frame);
+    return AVERROR_EXIT;   /* 取一帧即停 */
+}
+
+/*
+ * 无显示环境下验证完整导入链路：
+ *   VAAPI 解码 -> dmabuf 导出 -> EGLImage 导入 -> GL 纹理 -> FBO 读回比对
+ * 对比对象是同一帧经 av_hwframe_transfer_data 取回的 CPU 数据。
+ */
+static int dmabuf_gl_verify(const char *input, const char *device,
+                            const char *connection_type,
+                            int scale_width, int scale_height)
+{
+    EglHeadless *egl = NULL;
+    EglInterop *interop = NULL;
+    VaapiDecoderConfig config;
+    VaapiDecoder *decoder = NULL;
+    FrameCapture capture = { NULL };
+    VaapiDmabuf dmabuf;
+    AVFrame *sw = NULL;
+    uint8_t *readback_y = NULL;
+    uint8_t *readback_uv = NULL;
+    GLuint texture_y = 0, texture_uv = 0;
+    PsnrAccum accum_y = { 0.0, 0 }, accum_uv = { 0.0, 0 };
+    double psnr_y, psnr_uv;
+    int result = -1;
+    int ret;
+
+    egl = egl_headless_create();
+    if (!egl) {
+        LOG_ERROR("EGL surfaceless 初始化失败，无法验证导入");
+        return -1;
+    }
+    LOG_INFO("GL 渲染器: %s", glGetString(GL_RENDERER));
+
+    memset(&config, 0, sizeof(config));
+    config.device          = device;
+    config.connection_type = connection_type;
+    config.want_hw_frames  = 1;
+    config.max_frames      = 1;
+    config.scale_width     = scale_width;
+    config.scale_height    = scale_height;
+
+    if (vaapi_decoder_open(&decoder, input, &config) < 0)
+        goto end;
+    vaapi_decoder_decode(decoder, capture_frame_handler, &capture);
+    vaapi_decoder_close(decoder);
+    decoder = NULL;
+    if (!capture.frame) {
+        LOG_ERROR("没有解码到任何画面");
+        goto end;
+    }
+
+    if (vaapi_dmabuf_export(capture.frame, &dmabuf) < 0)
+        goto end;
+    vaapi_dmabuf_print(&dmabuf);
+
+    interop = egl_interop_create();
+    if (!interop) {
+        LOG_ERROR("当前 EGL 上下文不支持 dmabuf 导入（缺少 EGL_EXT_image_dma_buf_import）");
+        vaapi_dmabuf_release(&dmabuf);
+        goto end;
+    }
+    if (egl_interop_upload(interop, &dmabuf.desc, dmabuf.width, dmabuf.height) < 0) {
+        vaapi_dmabuf_release(&dmabuf);
+        goto end;
+    }
+    egl_interop_textures(interop, &texture_y, &texture_uv);
+    {
+        /* 释放后描述符会被清零，先把尺寸留存下来 */
+        int buf_width  = dmabuf.width;
+        int buf_height = dmabuf.height;
+
+        vaapi_dmabuf_release(&dmabuf);
+        dmabuf.width  = buf_width;
+        dmabuf.height = buf_height;
+    }
+    LOG_INFO("EGLImage 导入成功 (Y=%u UV=%u)", texture_y, texture_uv);
+
+    readback_y  = malloc((size_t)dmabuf.width * dmabuf.height);
+    readback_uv = malloc((size_t)dmabuf.width * dmabuf.height);
+    sw = av_frame_alloc();
+    if (!readback_y || !readback_uv || !sw) {
+        LOG_ERROR("分配读回缓冲区失败");
+        goto end;
+    }
+    ret = av_hwframe_transfer_data(sw, capture.frame, 0);
+    if (ret < 0) {
+        LOG_ERROR("取回参考帧失败: %s", vaapi_error_string(ret));
+        goto end;
+    }
+
+    if (egl_headless_read_texture(egl, texture_y, dmabuf.width, dmabuf.height, 1, readback_y) < 0 ||
+        egl_headless_read_texture(egl, texture_uv, dmabuf.width / 2, dmabuf.height / 2,
+                                  2, readback_uv) < 0) {
+        LOG_ERROR("读回纹理失败");
+        goto end;
+    }
+
+    psnr_accumulate(&accum_y, sw->data[0], sw->linesize[0],
+                    readback_y, dmabuf.width, capture.frame->width, capture.frame->height);
+    psnr_accumulate(&accum_uv, sw->data[1], sw->linesize[1],
+                    readback_uv, dmabuf.width,
+                    capture.frame->width, capture.frame->height / 2);
+
+    psnr_y  = psnr_value(&accum_y);
+    psnr_uv = psnr_value(&accum_uv);
+    LOG_INFO("导入纹理与 CPU 解码数据比对: Y 平面 PSNR=%.2f dB, UV 平面 PSNR=%.2f dB",
+             psnr_y, psnr_uv);
+
+    if (psnr_y >= 40.0 && psnr_uv >= 40.0) {
+        LOG_INFO("零拷贝显示链路验证通过：VAAPI -> dmabuf -> EGLImage -> GL 纹理");
+        result = 0;
+    } else {
+        LOG_ERROR("导入纹理与 CPU 解码数据不一致，请检查 EGL 导入实现");
+    }
+
+end:
+    free(readback_y);
+    free(readback_uv);
+    if (sw)
+        av_frame_free(&sw);
+    if (capture.frame)
+        av_frame_free(&capture.frame);
+    if (interop)
+        egl_interop_destroy(interop);
+    if (decoder)
+        vaapi_decoder_close(decoder);
+    if (egl)
+        egl_headless_destroy(egl);
+    return result;
+}
+#endif /* HAVE_EGL */
+
+static void dmabuf_usage(void)
+{
+    fprintf(stdout,
+        "用法: vaapi_demo dmabuf [选项]\n"
+        "\n"
+        "  解码若干帧并导出为 DRM PRIME(dmabuf)，打印 fd/fourcc/pitch/modifier，\n"
+        "  用于在没有显示环境的机器上验证“零拷贝到 GL”的导出接口是否可用。\n"
+        "\n"
+        "  -i, --input <文件>        输入视频（默认 samples/%s）\n"
+        "  -S, --scale <宽x高>       导出前用 VPP 缩放\n"
+        "      --gl                  用 EGL(surfaceless) 导入纹理并读回比对（无需显示环境）\n"
+        "      --max-frames <N>      检查帧数，默认 3\n"
+        "  -d, --device <节点>       DRM 设备\n"
+        "      --connection-type <t> drm(默认) / x11\n"
+        "  -q, --quiet               精简输出\n"
+        "  -h, --help                显示帮助\n",
+        SAMPLE_MP4);
+}
+
+static int command_dmabuf(int argc, char **argv)
+{
+    DmabufCheck check;
+    const char *input = NULL;
+    const char *device = NULL;
+    const char *connection_type = "drm";
+    char sample_path[4096];
+    int scale_width = 0;
+    int scale_height = 0;
+    int max_frames = 3;
+    int want_gl = 0;
+    int quiet = 0;
+    int c;
+    static const struct option options[] = {
+        { "input",           required_argument, NULL, 'i' },
+        { "scale",           required_argument, NULL, 'S' },
+        { "gl",              no_argument,       NULL, 1002 },
+        { "max-frames",      required_argument, NULL, 1000 },
+        { "device",          required_argument, NULL, 'd' },
+        { "connection-type", required_argument, NULL, 1001 },
+        { "quiet",           no_argument,       NULL, 'q' },
+        { "help",            no_argument,       NULL, 'h' },
+        { NULL, 0, NULL, 0 }
+    };
+
+    while ((c = getopt_long(argc, argv, "i:S:d:qh", options, NULL)) != -1) {
+        switch (c) {
+        case 'i': input = optarg; break;
+        case 'S':
+            if (vaapi_parse_size(optarg, &scale_width, &scale_height) < 0 ||
+                (scale_width & 1) || (scale_height & 1)) {
+                LOG_ERROR("缩放尺寸格式错误: %s (应形如 1280x720，且宽高为偶数)", optarg);
+                return 1;
+            }
+            break;
+        case 1000: max_frames = atoi(optarg); break;
+        case 1002: want_gl = 1; break;
+        case 'd': device = optarg; break;
+        case 1001: connection_type = optarg; break;
+        case 'q': quiet = 1; break;
+        case 'h':
+        default:
+            dmabuf_usage();
+            return c == 'h' ? 0 : 1;
+        }
+    }
+
+    if (!input) {
+        if (!util_find_sample(SAMPLE_MP4, sample_path, sizeof(sample_path))) {
+            LOG_ERROR("未指定 -i，且找不到示例文件 samples/%s", SAMPLE_MP4);
+            return 1;
+        }
+        input = sample_path;
+    }
+
+    if (want_gl) {
+#ifdef HAVE_EGL
+        return dmabuf_gl_verify(input, device, connection_type,
+                                scale_width, scale_height) < 0 ? 1 : 0;
+#else
+        LOG_WARN("本版本编译时未找到 EGL，改为只做导出检查（如需导入验证请安装 libegl-dev 后重新编译）");
+#endif
+    }
+
+    if (!quiet)
+        LOG_INFO("导出 %s 的前 %d 帧为 DRM PRIME ...", input, max_frames);
+
+    if (run_dmabuf_check(input, device, connection_type,
+                         scale_width, scale_height, max_frames, &check) < 0) {
+        LOG_ERROR("dmabuf 导出失败：共 %d 帧，其中 %d 帧异常", check.frames, check.failed);
+        return 1;
+    }
+
+    LOG_INFO("dmabuf 导出正常：%d 帧全部导出成功", check.frames);
     return 0;
 }
 
@@ -1189,15 +1550,15 @@ static int command_selftest(int argc, char **argv)
 
     LOG_INFO("================ VAAPI 全流程自检 ================");
 
-    LOG_INFO("[1/6] 检查 VAAPI 设备 ...");
+    LOG_INFO("[1/7] 检查 VAAPI 设备 ...");
     {
         AVBufferRef *device_ctx = vaapi_device_create(device, connection_type);
         if (!device_ctx) {
-            LOG_ERROR("[1/6] 失败: VAAPI 设备不可用");
+            LOG_ERROR("[1/7] 失败: VAAPI 设备不可用");
             return 1;
         }
         av_buffer_unref(&device_ctx);
-        LOG_INFO("[1/6] 通过");
+        LOG_INFO("[1/7] 通过");
     }
 
     memset(&encode, 0, sizeof(encode));
@@ -1214,12 +1575,12 @@ static int command_selftest(int argc, char **argv)
     encode.pix_fmt         = AV_PIX_FMT_YUV420P;
     encode.quiet           = quiet;
 
-    LOG_INFO("[2/6] 硬件编码 %s -> %s ...", encode.input, encode.output);
+    LOG_INFO("[2/7] 硬件编码 %s -> %s ...", encode.input, encode.output);
     if (run_encode(&encode, &encode_stats) < 0) {
-        LOG_ERROR("[2/6] 失败: 硬件编码失败");
+        LOG_ERROR("[2/7] 失败: 硬件编码失败");
         return 1;
     }
-    LOG_INFO("[2/6] 通过 (%d 帧, %.1f fps)", encode_stats.frames,
+    LOG_INFO("[2/7] 通过 (%d 帧, %.1f fps)", encode_stats.frames,
              encode_stats.seconds > 0 ? encode_stats.frames / encode_stats.seconds : 0.0);
 
     memset(&decode, 0, sizeof(decode));
@@ -1230,31 +1591,31 @@ static int command_selftest(int argc, char **argv)
     decode.out_format      = AV_PIX_FMT_YUV420P;
     decode.quiet           = quiet;
 
-    LOG_INFO("[3/6] 硬件解码 %s -> %s ...", decode.input, decode.output);
+    LOG_INFO("[3/7] 硬件解码 %s -> %s ...", decode.input, decode.output);
     if (run_decode(&decode, &decode_stats) < 0) {
-        LOG_ERROR("[3/6] 失败: 硬件解码失败");
+        LOG_ERROR("[3/7] 失败: 硬件解码失败");
         return 1;
     }
-    LOG_INFO("[3/6] 通过 (%d 帧, %.1f fps)", decode_stats.frames,
+    LOG_INFO("[3/7] 通过 (%d 帧, %.1f fps)", decode_stats.frames,
              decode_stats.seconds > 0 ? decode_stats.frames / decode_stats.seconds : 0.0);
 
-    LOG_INFO("[4/6] 画质校验（编码前 vs 解码后 PSNR）...");
+    LOG_INFO("[4/7] 画质校验（编码前 vs 解码后 PSNR）...");
     psnr = compare_yuv_files(encode.input, decode.output, encode.width, encode.height,
                              encode_stats.frames, &compared);
     if (compared <= 0) {
-        LOG_ERROR("[4/6] 失败: 无法比较 YUV 数据");
+        LOG_ERROR("[4/7] 失败: 无法比较 YUV 数据");
         return 1;
     }
-    LOG_INFO("[4/6] 对比 %d 帧, PSNR = %.2f dB %s", compared, psnr,
+    LOG_INFO("[4/7] 对比 %d 帧, PSNR = %.2f dB %s", compared, psnr,
              psnr >= 30.0 ? "(通过)" : "(偏低，请检查显卡状态)");
     if (psnr < 30.0) {
-        LOG_ERROR("[4/6] 失败: PSNR 过低");
+        LOG_ERROR("[4/7] 失败: PSNR 过低");
         return 1;
     }
 
-    LOG_INFO("[5/6] 解码示例视频 %s ...", SAMPLE_MP4);
+    LOG_INFO("[5/7] 解码示例视频 %s ...", SAMPLE_MP4);
     if (!util_find_sample(SAMPLE_MP4, mp4_path, sizeof(mp4_path))) {
-        LOG_WARN("[5/6] 跳过: 找不到 samples/%s", SAMPLE_MP4);
+        LOG_WARN("[5/7] 跳过: 找不到 samples/%s", SAMPLE_MP4);
     } else {
         memset(&decode, 0, sizeof(decode));
         decode.input           = mp4_path;
@@ -1265,14 +1626,14 @@ static int command_selftest(int argc, char **argv)
         decode.max_frames      = 30;
         decode.quiet           = quiet;
         if (run_decode(&decode, &decode_stats) < 0) {
-            LOG_ERROR("[5/6] 失败: 示例视频解码失败");
+            LOG_ERROR("[5/7] 失败: 示例视频解码失败");
             return 1;
         }
-        LOG_INFO("[5/6] 通过 (%d 帧, %.1f fps)", decode_stats.frames,
+        LOG_INFO("[5/7] 通过 (%d 帧, %.1f fps)", decode_stats.frames,
                  decode_stats.seconds > 0 ? decode_stats.frames / decode_stats.seconds : 0.0);
     }
 
-    LOG_INFO("[6/6] VPP 缩放：编码 1920x1080 -> 1280x720，再解码 1280x720 -> 640x360 ...");
+    LOG_INFO("[6/7] VPP 缩放：编码 1920x1080 -> 1280x720，再解码 1280x720 -> 640x360 ...");
     {
         int64_t expected;
         int64_t actual;
@@ -1281,7 +1642,7 @@ static int command_selftest(int argc, char **argv)
         encode.scale_width = 1280;
         encode.scale_height = 720;
         if (run_encode(&encode, &encode_stats) < 0) {
-            LOG_ERROR("[6/6] 失败: 编码前 VPP 缩放失败");
+            LOG_ERROR("[6/7] 失败: 编码前 VPP 缩放失败");
             return 1;
         }
 
@@ -1295,19 +1656,34 @@ static int command_selftest(int argc, char **argv)
         decode.scale_height    = 360;
         decode.quiet           = quiet;
         if (run_decode(&decode, &decode_stats) < 0) {
-            LOG_ERROR("[6/6] 失败: 解码后 VPP 缩放失败");
+            LOG_ERROR("[6/7] 失败: 解码后 VPP 缩放失败");
             return 1;
         }
 
         expected = (int64_t)decode.scale_width * decode.scale_height * 3 / 2 * decode_stats.frames;
         actual   = util_file_size(decode.output);
         if (decode_stats.frames <= 0 || actual != expected) {
-            LOG_ERROR("[6/6] 失败: 缩放输出尺寸不符 (期望 %lld 字节, 实际 %lld 字节)",
+            LOG_ERROR("[6/7] 失败: 缩放输出尺寸不符 (期望 %lld 字节, 实际 %lld 字节)",
                       (long long)expected, (long long)actual);
             return 1;
         }
-        LOG_INFO("[6/6] 通过 (%d 帧, 输出 %dx%d)", decode_stats.frames,
+        LOG_INFO("[6/7] 通过 (%d 帧, 输出 %dx%d)", decode_stats.frames,
                  decode.scale_width, decode.scale_height);
+    }
+
+    LOG_INFO("[7/7] 零拷贝显示前置检查：VAAPI 帧导出为 DRM PRIME(dmabuf) ...");
+    {
+        DmabufCheck check;
+
+        if (!util_find_sample(SAMPLE_MP4, mp4_path, sizeof(mp4_path))) {
+            LOG_WARN("[7/7] 跳过: 找不到 samples/%s", SAMPLE_MP4);
+        } else if (run_dmabuf_check(mp4_path, device, connection_type, 0, 0, 5, &check) < 0) {
+            LOG_ERROR("[7/7] 失败: dmabuf 导出失败（共 %d 帧，异常 %d 帧）",
+                      check.frames, check.failed);
+            return 1;
+        } else {
+            LOG_INFO("[7/7] 通过 (%d 帧导出成功，可交给 EGL 零拷贝导入 GL)", check.frames);
+        }
     }
 
     LOG_INFO("==================================================");
@@ -1330,8 +1706,9 @@ static void print_usage(const char *program)
         "  info        查看 VAAPI 环境、驱动能力、FFmpeg 硬件编解码器支持\n"
         "  encode      硬件编码: YUV 原始数据 -> H.264 / H.265 码流\n"
         "  decode      硬件解码: MP4/H.264/H.265 -> YUV 原始数据\n"
-        "  play        硬件解码并实时显示（需要 glfw3）\n"
+        "  play        硬件解码并实时显示（EGL + Wayland 窗口）\n"
         "  transcode   解码 + 编码转码，默认零拷贝（帧数据不出显存）\n"
+        "  dmabuf      导出 DRM PRIME 并打印描述符，验证零拷贝到 GL 的导出接口\n"
         "  selftest    一键全流程自检（编码 -> 解码 -> PSNR 校验）\n"
         "\n"
         "常用示例:\n"
@@ -1370,6 +1747,8 @@ int main(int argc, char **argv)
         return command_play(argc - 1, argv + 1);
     if (!strcmp(command, "transcode"))
         return command_transcode(argc - 1, argv + 1);
+    if (!strcmp(command, "dmabuf"))
+        return command_dmabuf(argc - 1, argv + 1);
     if (!strcmp(command, "selftest"))
         return command_selftest(argc - 1, argv + 1);
     if (!strcmp(command, "info")) {
